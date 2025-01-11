@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -41,7 +41,7 @@ type (
 	}
 )
 
-// `ais ls`, `ais ls s3:` and similar
+// `ais ls`, `ais ls s3:`, `ais ls s3://aaa --prefix bbb --summary` and similar
 func listBckTable(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, lsb lsbCtx) (cnt int) {
 	if flagIsSet(c, bckSummaryFlag) {
 		args := api.BinfoArgs{
@@ -50,7 +50,8 @@ func listBckTable(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, lsb lsbCtx)
 			Summarize:     true,
 			DontAddRemote: flagIsSet(c, dontAddRemoteFlag),
 		}
-		cnt = listBckTableWithSummary(c, qbck, bcks, args)
+		prefix := cos.Left(parseStrFlag(c, listObjPrefixFlag), lsb.prefix /*as in: bucket/[prefix]*/)
+		cnt = listBckTableWithSummary(c, qbck, bcks, args, prefix)
 	} else {
 		cnt = listBckTableNoSummary(c, qbck, bcks, lsb.fltPresence)
 	}
@@ -91,7 +92,7 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 		if info.IsBckPresent {
 			footer.nbp++
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			if bmd == nil {
 				bmd, err = api.GetBMD(apiBP)
 				if err != nil {
@@ -130,7 +131,7 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 }
 
 // compare with `showBucketSummary`
-func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, args api.BinfoArgs) int {
+func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, args api.BinfoArgs, prefix string) int {
 	var (
 		footer     lsbFooter
 		hideHeader = flagIsSet(c, noHeaderFlag)
@@ -139,7 +140,6 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 
 		objCached  = flagIsSet(c, listObjCachedFlag)
 		bckPresent = flagIsSet(c, allObjsOrBcksFlag)
-		prefix     = parseStrFlag(c, listObjPrefixFlag)
 	)
 	debug.Assert(args.Summarize)
 	ctx, err := newBsummCtxMsg(c, qbck, prefix, objCached, bckPresent)
@@ -150,10 +150,11 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 	// because api.BinfoArgs (left) contains api.BsummArgs (right)
 	args.CallAfter = ctx.args.CallAfter
 	args.Callback = ctx.args.Callback
+	args.Prefix = prefix
 
 	// one at a time
 	prev := ctx.started
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(ctx.units)}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(ctx.units, false /*incl. calendar date*/)}
 	data := make([]teb.ListBucketsHelper, 0, len(bcks))
 	for i := range bcks {
 		bck := bcks[i]
@@ -161,7 +162,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 			continue
 		}
 		ctx.qbck = cmn.QueryBcks(bck)
-		xid, props, info, err := api.GetBucketInfo(apiBP, bck, args)
+		xid, props, info, err := api.GetBucketInfo(apiBP, bck, &args)
 		if err != nil {
 			var partial bool
 			if herr, ok := err.(*cmn.ErrHTTP); ok {
@@ -185,7 +186,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 			footer.size += info.TotalSize.OnDisk
 			footer.pct += int(info.UsedPct)
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			bck.Name += " (URL: " + props.Extra.HTTP.OrigURLBck + ")"
 		}
 		data = append(data, teb.ListBucketsHelper{XactID: xid, Bck: bck, Props: props, Info: info})
@@ -244,7 +245,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 	return footer.nb
 }
 
-func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) error {
+func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpty bool) error {
 	// prefix and filter
 	lstFilter, prefixFromTemplate, err := newLstFilter(c)
 	if err != nil {
@@ -276,11 +277,11 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	}
 	if flagIsSet(c, verChangedFlag) {
 		if bck.IsAIS() {
-			return fmt.Errorf("flag %s requires remote bucket (have: %s)", qflprn(verChangedFlag), bck)
+			return fmt.Errorf("flag %s requires remote bucket (have: %s)", qflprn(verChangedFlag), bck.String())
 		}
 		if !bck.HasVersioningMD() {
 			return fmt.Errorf("flag %s only applies to remote backends that maintain at least some form of versioning information (have: %s)",
-				qflprn(verChangedFlag), bck)
+				qflprn(verChangedFlag), bck.String())
 		}
 		msg.SetFlag(apc.LsVerChanged)
 	}
@@ -313,6 +314,9 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	if flagIsSet(c, noRecursFlag) {
 		msg.SetFlag(apc.LsNoRecursion)
 	}
+	if flagIsSet(c, noDirsFlag) {
+		msg.SetFlag(apc.LsNoDirs)
+	}
 
 	var (
 		props    []string
@@ -325,7 +329,8 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	}
 
 	// add _implied_ props into control lsmsg
-	if flagIsSet(c, nameOnlyFlag) {
+	switch {
+	case flagIsSet(c, nameOnlyFlag):
 		if flagIsSet(c, verChangedFlag) {
 			return fmt.Errorf(errFmtExclusive, qflprn(verChangedFlag), qflprn(nameOnlyFlag))
 		}
@@ -335,18 +340,19 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 		}
 		msg.SetFlag(apc.LsNameOnly)
 		msg.Props = apc.GetPropsName
-	} else if len(props) == 0 {
-		if flagIsSet(c, dontAddRemoteFlag) {
+	case len(props) == 0:
+		switch {
+		case flagIsSet(c, dontAddRemoteFlag):
 			msg.AddProps(apc.GetPropsName)
 			msg.AddProps(apc.GetPropsSize)
 			msg.SetFlag(apc.LsNameSize)
-		} else if catOnly {
+		case catOnly:
 			msg.SetFlag(apc.LsNameOnly)
 			msg.Props = apc.GetPropsName
-		} else {
+		default:
 			msg.AddProps(apc.GetPropsMinimal...)
 		}
-	} else {
+	default:
 		if cos.StringInSlice(allPropsFlag.GetName(), props) {
 			msg.AddProps(apc.GetPropsAll...)
 		} else {
@@ -354,6 +360,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			msg.AddProps(props...)
 		}
 	}
+
 	if flagIsSet(c, allObjsOrBcksFlag) {
 		// Show status. Object name can then be displayed multiple times
 		// (due to mirroring, EC). The status helps to tell an object from its replica(s).
@@ -404,7 +411,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			if catOnly {
 				now = mono.NanoTime()
 			}
-			objList, err := api.ListObjectsPage(apiBP, bck, msg, lsargs)
+			lst, err := api.ListObjectsPage(apiBP, bck, msg, lsargs)
 			if err != nil {
 				return lsoErr(msg, err)
 			}
@@ -412,10 +419,10 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			// print exact number of objects if it is `limit`ed: in case of
 			// limit > page size, the last page is printed partially
 			var toPrint cmn.LsoEntries
-			if limit > 0 && toShow < len(objList.Entries) {
-				toPrint = objList.Entries[:toShow]
+			if limit > 0 && toShow < len(lst.Entries) {
+				toPrint = lst.Entries[:toShow]
 			} else {
-				toPrint = objList.Entries
+				toPrint = lst.Entries
 			}
 			err = printLso(c, toPrint, lstFilter, propsStr, nil /*_listed*/, now,
 				addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
@@ -435,7 +442,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 				return nil
 			}
 			if limit > 0 {
-				toShow -= len(objList.Entries)
+				toShow -= len(lst.Entries)
 				if toShow <= 0 {
 					return nil
 				}
@@ -446,7 +453,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	// alternatively (when `--paged` not specified) list all pages up to a limit, show progress
 	var (
 		callAfter = listObjectsWaitTime
-		_listed   = &_listed{c: c, bck: &bck, limit: int(limit)}
+		_listed   = &_listed{c: c, bck: &bck, msg: msg, limit: int(limit)}
 	)
 	if flagIsSet(c, refreshFlag) {
 		callAfter = parseDurationFlag(c, refreshFlag)
@@ -456,11 +463,14 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	}
 	lsargs.Callback = _listed.cb
 	lsargs.CallAfter = callAfter
-	objList, err := api.ListObjects(apiBP, bck, msg, lsargs)
+	lst, err := api.ListObjects(apiBP, bck, msg, lsargs)
 	if err != nil {
 		return lsoErr(msg, err)
 	}
-	return printLso(c, objList.Entries, lstFilter, propsStr, _listed, now,
+	if len(lst.Entries) == 0 && !printEmpty {
+		return fmt.Errorf("%s/%s not found", bck.Cname(""), msg.Prefix)
+	}
+	return printLso(c, lst.Entries, lstFilter, propsStr, _listed, now,
 		addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
 }
 
@@ -557,19 +567,19 @@ func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, prop
 			return nil
 		}
 		elapsed := teb.FormatDuration(mono.Since(now))
-		fmt.Fprintln(c.App.Writer, listedText, cos.FormatBigNum(len(matched)), "names in", elapsed)
+		fmt.Fprintln(c.App.Writer, listedText, cos.FormatBigInt(len(matched)), "names in", elapsed)
 		return nil
 	}
 
 	// otherwise, print names
 	tmpl := teb.LsoTemplate(propsList, hideHeader, addCachedCol, addStatusCol)
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, false /*incl. calendar date*/)}
 	if err := teb.Print(matched, tmpl, opts); err != nil {
 		return err
 	}
 
 	if !hideFooter && len(matched) > 10 {
-		fmt.Fprintln(c.App.Writer, fblue(listedText), cos.FormatBigNum(len(matched)), "names")
+		fmt.Fprintln(c.App.Writer, fblue(listedText), cos.FormatBigInt(len(matched)), "names")
 	}
 	if flagIsSet(c, showUnmatchedFlag) && len(other) > 0 {
 		unmatched := fcyan("\nNames that didn't match: ") + strconv.Itoa(len(other))
@@ -588,7 +598,11 @@ func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, prop
 func newLstFilter(c *cli.Context) (flt *lstFilter, prefix string, _ error) {
 	flt = &lstFilter{}
 	if !flagIsSet(c, allObjsOrBcksFlag) {
-		// filter objects that are "not OK" (e.g., misplaced)
+		// filter objects that are (any of the below):
+		// - apc.LocMisplacedNode
+		// - apc.LocMisplacedMountpath
+		// - apc.LocIsCopy
+		// - apc.LocIsCopyMissingObj
 		flt._add(func(obj *cmn.LsoEnt) bool { return obj.IsStatusOK() })
 	}
 	if regexStr := parseStrFlag(c, regexLsAnyFlag); regexStr != "" {
@@ -682,43 +696,53 @@ func splitObjnameShardBoundary(fullName string) (objName, fileName string) {
 type _listed struct {
 	c     *cli.Context
 	bck   *cmn.Bck
+	msg   *apc.LsoMsg
 	limit int
 	l     int
 	done  bool
 	cptn  bool
 }
 
-func (u *_listed) cb(ctx *api.LsoCounter) {
-	if ctx.Count() < 0 || u.done {
+func (u *_listed) cb(lsoCounter *api.LsoCounter) {
+	if lsoCounter.Count() < 0 || u.done {
 		return
 	}
-	if ctx.IsFinished() || (u.limit > 0 && u.limit <= ctx.Count()) {
+	if lsoCounter.IsFinished() || (u.limit > 0 && u.limit <= lsoCounter.Count()) {
 		u.done = true
 		if !flagIsSet(u.c, noFooterFlag) {
-			elapsed := teb.FormatDuration(ctx.Elapsed())
-			fmt.Fprintf(u.c.App.Writer, "\r%s %s names in %s\n", listedText, cos.FormatBigNum(ctx.Count()), elapsed)
+			elapsed := teb.FormatDuration(lsoCounter.Elapsed())
+			fmt.Fprintf(u.c.App.Writer, "\r%s %s names in %s\n", listedText, cos.FormatBigInt(lsoCounter.Count()), elapsed)
 			u.cptn = true
 			briefPause(1)
 		}
 		return
 	}
 
-	s := listedText + " " + cos.FormatBigNum(ctx.Count()) + " names"
+	var (
+		sb strings.Builder
+	)
+	sb.Grow(128)
+	sb.WriteString(listedText)
+	sb.WriteByte(' ')
+	sb.WriteString(cos.FormatBigInt(lsoCounter.Count()))
+	sb.WriteString(" names")
+	l := sb.Len()
 	if u.l == 0 {
-		u.l = len(s) + 3
-		if u.bck.IsRemote() {
-			var tip string
-			if flagIsSet(u.c, listObjCachedFlag) {
-				tip = fmt.Sprintf("use %s to show pages immediately - one page at a time", qflprn(pagedFlag))
-			} else {
-				tip = fmt.Sprintf("use %s to speed up and/or %s to show pages", qflprn(listObjCachedFlag), qflprn(pagedFlag))
-			}
+		u.l = l + 3
+		// tip
+		if u.msg.IsFlagSet(apc.LsObjCached) {
+			tip := fmt.Sprintf("consider using %s to show pages one at a time (tip)", qflprn(pagedFlag))
+			actionNote(u.c, tip)
+		} else if u.bck.IsRemote() {
+			tip := fmt.Sprintf("use %s to speed up and/or %s to show pages", qflprn(listObjCachedFlag), qflprn(pagedFlag))
 			note := fmt.Sprintf("listing remote objects in %s may take a while\n(Tip: %s)\n", u.bck.Cname(""), tip)
 			actionNote(u.c, note)
 		}
-	} else if len(s) > u.l {
-		u.l = len(s) + 2
+	} else if l > u.l {
+		u.l = l + 2
 	}
-	s += strings.Repeat(" ", u.l-len(s))
-	fmt.Fprintf(u.c.App.Writer, "\r%s", s)
+	for range u.l - l {
+		sb.WriteByte(' ')
+	}
+	fmt.Fprintf(u.c.App.Writer, "\r%s", sb.String())
 }

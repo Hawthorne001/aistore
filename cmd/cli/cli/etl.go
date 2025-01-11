@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -20,7 +20,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/ext/etl"
-	"github.com/fatih/color"
 	"github.com/urfave/cli"
 )
 
@@ -58,12 +57,14 @@ var (
 			etlBucketRequestTimeout,
 			listFlag,
 			templateFlag,
+			numListRangeWorkersFlag,
 			verbObjPrefixFlag,
 			// TODO: progressFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 		},
-		cmdStart: {},
+		cmdStart:      {},
+		commandRemove: {},
 	}
 	showCmdETL = cli.Command{
 		Name:   commandShow,
@@ -93,6 +94,14 @@ var (
 		Action:       etlStartHandler,
 		BashComplete: etlIDCompletions,
 		Flags:        etlSubFlags[cmdStart],
+	}
+	removeCmdETL = cli.Command{
+		Name:         commandRemove,
+		Usage:        "remove ETL",
+		ArgsUsage:    etlNameArgument,
+		Action:       etlRemoveHandler,
+		BashComplete: etlIDCompletions,
+		Flags:        etlSubFlags[commandRemove],
 	}
 	initCmdETL = cli.Command{
 		Name:  cmdInit,
@@ -144,6 +153,7 @@ var (
 			logsCmdETL,
 			startCmdETL,
 			stopCmdETL,
+			removeCmdETL,
 			objCmdETL,
 			bckCmdETL,
 		},
@@ -319,7 +329,7 @@ func etlList(c *cli.Context, caption bool) (int, error) {
 	}
 	if caption {
 		onlyActive := !flagIsSet(c, allJobsFlag)
-		jobCptn(c, commandETL, onlyActive, "", false)
+		jobCptn(c, commandETL, "" /*xid*/, "" /*ctlmsg*/, onlyActive, false)
 	}
 
 	hideHeader := flagIsSet(c, noHeaderFlag)
@@ -440,21 +450,29 @@ func etlStartHandler(c *cli.Context) (err error) {
 	}
 	etlName := c.Args()[0]
 	if err := api.ETLStart(apiBP, etlName); err != nil {
-		if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
-			color.New(color.FgYellow).Fprintf(c.App.Writer, "ETL[%s] not found", etlName)
-		}
 		return V(err)
 	}
 	fmt.Fprintf(c.App.Writer, "ETL[%s] started successfully\n", etlName)
 	return nil
 }
 
-func etlObjectHandler(c *cli.Context) error {
+func etlRemoveHandler(c *cli.Context) (err error) {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 1 {
+	}
+	etlName := c.Args()[0]
+	if err := api.ETLDelete(apiBP, etlName); err != nil {
+		return V(err)
+	}
+	fmt.Fprintf(c.App.Writer, "ETL[%s] successfully deleted\n", etlName)
+	return nil
+}
+
+func etlObjectHandler(c *cli.Context) error {
+	switch c.NArg() {
+	case 0, 1:
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 2 {
+	case 2:
 		return missingArgumentsError(c, "OUTPUT")
 	}
 
@@ -469,11 +487,12 @@ func etlObjectHandler(c *cli.Context) error {
 	}
 
 	var w io.Writer
-	if outputDest == "-" {
+	switch {
+	case outputDest == "-":
 		w = os.Stdout
-	} else if discardOutput(outputDest) {
+	case discardOutput(outputDest):
 		w = io.Discard
-	} else {
+	default:
 		f, err := os.Create(outputDest)
 		if err != nil {
 			return err

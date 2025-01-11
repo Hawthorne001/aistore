@@ -169,6 +169,11 @@ func (*factory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 func (p *factory) Start() error {
 	xdl := newXact(p)
 	p.xctn = xdl
+
+	g.once.Do(func() {
+		g.store = newInfoStore(g.db)
+	})
+
 	go xdl.Run(nil)
 	return nil
 }
@@ -187,7 +192,7 @@ func (*factory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 func newXact(p *factory) (xld *Xact) {
 	xld = &Xact{p: p}
 	xld.dispatcher = newDispatcher(xld)
-	xld.DemandBase.Init(p.UUID(), apc.Download, p.bck, 0 /*use default*/)
+	xld.DemandBase.Init(p.UUID(), apc.Download, "" /*ctlmsg*/, p.bck, 0 /*use default*/)
 	return
 }
 

@@ -108,10 +108,11 @@ func Walk(opts *WalkOpts) error {
 		err  error
 		ew   = &errCallbackWrapper{}
 	)
-	if opts.Dir != "" {
+	switch {
+	case opts.Dir != "":
 		debug.Assert(opts.Prefix == "")
 		fqns = append(fqns, opts.Dir)
-	} else if opts.Bck.Name != "" {
+	case opts.Bck.Name != "":
 		debug.Assert(len(opts.CTs) > 0)
 		// one bucket
 		for _, ct := range opts.CTs {
@@ -122,8 +123,7 @@ func Walk(opts *WalkOpts) error {
 				fqns = append(fqns, bdir)
 			}
 		}
-	} else {
-		// all buckets
+	default: // all buckets
 		debug.Assert(len(opts.CTs) > 0)
 		fqns, err = allMpathCTpaths(opts)
 		if len(fqns) == 0 || err != nil {
@@ -142,9 +142,8 @@ func Walk(opts *WalkOpts) error {
 		if err1 == nil || os.IsNotExist(err1) {
 			continue
 		}
-		// NOTE: mountpath is getting detached or disabled
-		if cmn.IsErrMountpathNotFound(err1) {
-			nlog.Errorln(err1)
+		if cmn.IsErrMpathNotFound(err1) {
+			nlog.Errorln(err1) // mountpath is getting detached or disabled
 			continue
 		}
 		if cmn.IsErrAborted(err1) {
@@ -155,8 +154,8 @@ func Walk(opts *WalkOpts) error {
 			}
 			continue
 		}
-		if err1 != context.Canceled && !cos.IsNotExist(err1, 0) {
-			nlog.Errorln(err1)
+		if err1 != context.Canceled && !cmn.IsErrObjNought(err1) {
+			nlog.Errorln(err)
 		}
 		err = err1
 	}

@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -64,14 +64,14 @@ type (
 
 	// Request buffer that corresponds to a single `uuid`.
 	lsobjBuffer struct {
+		// Buffers for each target that are finally merged and the entries are
+		// appended to the `currentBuff`.
+		leftovers map[string]*lsobjBufferTarget // targetID (string) -> target buffer
 		// Contains the last entry that was returned to the user.
 		nextToken string
 		// Currently maintained buffer that keeps the entries sorted
 		// and ready to be dispatched to the client.
 		currentBuff cmn.LsoEntries
-		// Buffers for each target that are finally merged and the entries are
-		// appended to the `currentBuff`.
-		leftovers map[string]*lsobjBufferTarget // targetID (string) -> target buffer
 		// Timestamp of the last access to this buffer. Idle buffers get removed
 		// after `lsobjBufferTTL`.
 		lastAccess atomic.Int64
@@ -113,8 +113,8 @@ type (
 
 	// Single cache that corresponds to single `cacheReqID`.
 	lsobjCache struct {
-		mtx       sync.RWMutex
 		intervals []*cacheInterval
+		mtx       sync.RWMutex
 	}
 
 	// Contains all lsobj caches.
@@ -136,9 +136,9 @@ func (qm *lsobjMem) init() {
 	hk.Reg("lsobj-buffer-cache"+hk.NameSuffix, qm.housekeep, qmTimeHk)
 }
 
-func (qm *lsobjMem) housekeep() time.Duration {
-	num := qm.b.housekeep()
-	num += qm.c.housekeep()
+func (qm *lsobjMem) housekeep(now int64) time.Duration {
+	num := qm.b.housekeep(now)
+	num += qm.c.housekeep(now)
 	if num == 0 {
 		qm.d = min(qm.d+qmTimeHk, qmTimeHkMax)
 	} else {
@@ -283,11 +283,12 @@ func (b *lsobjBuffers) set(id, targetID string, entries cmn.LsoEntries, size int
 	v.(*lsobjBuffer).set(targetID, entries, size)
 }
 
-func (b *lsobjBuffers) housekeep() (num int) {
+func (b *lsobjBuffers) housekeep(now int64) (num int) {
 	b.buffers.Range(func(key, value any) bool {
 		buffer := value.(*lsobjBuffer)
 		num++
-		if mono.Since(buffer.lastAccess.Load()) > lsobjBufferTTL {
+		// mono.Since(lastAccess)
+		if now-buffer.lastAccess.Load() > int64(lsobjBufferTTL) {
 			b.buffers.Delete(key)
 		}
 		return true
@@ -400,24 +401,22 @@ func (c *lsobjCache) findInterval(token string) *cacheInterval {
 // PRECONDITION: `c.mtx` must be locked.
 func (c *lsobjCache) merge(start, end, cur *cacheInterval) {
 	debug.AssertRWMutexLocked(&c.mtx)
-
-	if start == nil && end == nil {
+	switch {
+	case start == nil && end == nil:
 		c.intervals = append(c.intervals, cur)
-	} else if start != nil && end == nil {
+	case start != nil && end == nil:
 		start.append(cur)
-	} else if start == nil && end != nil {
+	case start == nil && end != nil:
 		end.prepend(cur)
-	} else if start != nil && end != nil {
+	default:
+		debug.Assert(start != nil && end != nil)
 		if start == end {
 			// `cur` is part of some interval.
 			return
 		}
-
 		start.append(cur)
 		start.append(end)
 		c.removeInterval(end)
-	} else {
-		debug.Assert(false)
 	}
 }
 
@@ -510,14 +509,15 @@ func (c *lsobjCaches) invalidate(bck *cmn.Bck) {
 }
 
 // TODO: factor-in memory pressure.
-func (c *lsobjCaches) housekeep() (num int) {
+func (c *lsobjCaches) housekeep(now int64) (num int) {
 	var toRemove []*cacheInterval
 	c.caches.Range(func(key, value any) bool {
 		cache := value.(*lsobjCache)
 		cache.mtx.Lock()
 		for _, interval := range cache.intervals {
 			num++
-			if mono.Since(interval.lastAccess) > cacheIntervalTTL {
+			// mono.Since(lastAccess)
+			if now-interval.lastAccess > int64(cacheIntervalTTL) {
 				toRemove = append(toRemove, interval)
 			}
 		}

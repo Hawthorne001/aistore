@@ -6,11 +6,11 @@ package meta
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/xoshiro256"
 	"github.com/OneOfOne/xxhash"
 )
@@ -19,28 +19,22 @@ import (
 // aka highest random weight (HRW)
 // See also: fs/hrw.go
 
-var robin atomic.Uint64 // round
-
-func (smap *Smap) HrwName2T(uname string) (*Snode, error) {
-	digest := xxhash.Checksum64S(cos.UnsafeB(uname), cos.MLCG32)
+func (smap *Smap) HrwName2T(uname []byte) (*Snode, error) {
+	digest := xxhash.Checksum64S(uname, cos.MLCG32)
 	return smap.HrwHash2T(digest)
 }
 
-func (smap *Smap) HrwMultiHome(uname string) (si *Snode, netName string, err error) {
-	digest := xxhash.Checksum64S(cos.UnsafeB(uname), cos.MLCG32)
+// TODO: control plane multihoming: return LRU data plane interface
+
+func (smap *Smap) HrwMultiHome(uname []byte) (si *Snode, netName string, err error) {
+	digest := xxhash.Checksum64S(uname, cos.MLCG32)
 	si, err = smap.HrwHash2T(digest)
 	if err != nil {
 		return nil, cmn.NetPublic, err
 	}
-	l := len(si.PubExtra)
-	if l == 0 {
-		return si, cmn.NetPublic, nil
-	}
-	i := robin.Add(1) % uint64(l+1)
-	if i == 0 {
-		return si, cmn.NetPublic, nil
-	}
-	return si, si.PubExtra[i-1].URL, nil
+
+	debug.Assert(si.nmr != nil, si.StringEx(), " in ", smap.StringEx()) // see related: smapOwner.put
+	return si, si.nmr.name(), nil
 }
 
 func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
@@ -160,14 +154,15 @@ type hrwList struct {
 // Returns error if the cluster does not have enough targets.
 // If count == length of Smap.Tmap, the function returns as many targets as possible.
 
-func (smap *Smap) HrwTargetList(uname string, count int) (sis Nodes, err error) {
+func (smap *Smap) HrwTargetList(uname *string, count int) (sis Nodes, err error) {
 	const fmterr = "%v: required %d, available %d, %s"
 	cnt := smap.CountTargets()
 	if cnt < count {
 		err = fmt.Errorf(fmterr, cmn.ErrNotEnoughTargets, count, cnt, smap)
 		return
 	}
-	digest := xxhash.Checksum64S(cos.UnsafeB(uname), cos.MLCG32)
+	b := cos.UnsafeBptr(uname)
+	digest := xxhash.Checksum64S(*b, cos.MLCG32)
 	hlist := newHrwList(count)
 
 	for _, tsi := range smap.Tmap {

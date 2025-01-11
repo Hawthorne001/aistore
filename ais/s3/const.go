@@ -4,8 +4,6 @@
  */
 package s3
 
-import "fmt"
-
 const (
 	// AWS URL params
 	QparamVersioning        = "versioning"
@@ -32,12 +30,8 @@ const (
 	QparamSignature   = "Signature"
 	QparamXID         = "x-id"
 
-	HeaderAlgorithm     = "X-Amz-Algorithm"
-	HeaderCredentials   = "X-Amz-Credential" //nolint:gosec // This is just a header name definition...
-	HeaderDate          = "X-Amz-Date"
-	HeaderExpires       = "X-Amz-Expires"
-	HeaderSignedHeaders = "X-Amz-SignedHeaders"
-	HeaderSignature     = "X-Amz-Signature"
+	HeaderPrefix      = "X-Amz-"
+	HeaderCredentials = "X-Amz-Credential" //nolint:gosec // This is just a header name definition...
 
 	versioningEnabled  = "Enabled"
 	versioningDisabled = "Suspended"
@@ -47,12 +41,7 @@ const (
 	MaxPartsPerUpload = 10000
 
 	s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01"
-	s3URL       = "https://%s.s3.%s.amazonaws.com/%s?%s"
 
 	AISRegion = "ais"
 	AISServer = "AIStore"
 )
-
-func makeS3URL(region, bucketName, objectName, query string) string {
-	return fmt.Sprintf(s3URL, bucketName, region, objectName, query)
-}

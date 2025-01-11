@@ -1,7 +1,7 @@
 // Package xs contains most of the supported eXtended actions (xactions) with some
 // exceptions that include certain storage services (mirror, EC) and extensions (downloader, lru).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -30,6 +30,7 @@ type (
 		lomVisitedCb lomVisitedCb
 		markerDir    string
 		wanted       cos.BitFlags
+		custom       cos.StrKVs
 	}
 )
 
@@ -51,6 +52,9 @@ func newWalkInfo(msg *apc.LsoMsg, lomVisitedCb lomVisitedCb) (wi *walkInfo) {
 			wi.markerDir = ""
 		}
 	}
+	if msg.IsFlagSet(apc.LsVerChanged) {
+		wi.custom = make(cos.StrKVs)
+	}
 	return
 }
 
@@ -62,7 +66,7 @@ func (wi *walkInfo) processDir(fqn string) error {
 		return nil
 	}
 
-	if !cmn.DirHasOrIsPrefix(ct.ObjectName(), wi.msg.Prefix) {
+	if wi.msg.Prefix != "" && !cmn.DirHasOrIsPrefix(ct.ObjectName(), wi.msg.Prefix) {
 		return filepath.SkipDir
 	}
 
@@ -77,7 +81,7 @@ func (wi *walkInfo) processDir(fqn string) error {
 }
 
 func (wi *walkInfo) match(objName string) bool {
-	if !cmn.ObjHasPrefix(objName, wi.msg.Prefix) {
+	if wi.msg.Prefix != "" && !cmn.ObjHasPrefix(objName, wi.msg.Prefix) {
 		return false
 	}
 	return wi.msg.ContinuationToken == "" || !cmn.TokenGreaterEQ(wi.msg.ContinuationToken, objName)
@@ -86,7 +90,18 @@ func (wi *walkInfo) match(objName string) bool {
 // new entry to be added to the listed page (note: slow path)
 func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEnt) {
 	e = &cmn.LsoEnt{Name: lom.ObjName, Flags: status | apc.EntryIsCached}
-	if wi.msg.IsFlagSet(apc.LsVerChanged) {
+
+	if lom.IsFntl() {
+		orig := lom.OrigFntl()
+		if orig != nil {
+			saved := lom.PushFntl(orig)
+			if wi.msg.IsFlagSet(apc.LsVerChanged) {
+				checkRemoteMD(lom, e)
+			}
+			lom.PopFntl(saved)
+			e.Name = orig[1]
+		}
+	} else if wi.msg.IsFlagSet(apc.LsVerChanged) {
 		checkRemoteMD(lom, e)
 	}
 	if wi.msg.IsFlagSet(apc.LsNameOnly) {
@@ -97,12 +112,8 @@ func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEnt) {
 	return
 }
 
-// NOTE: slow path
+// NOTE: slow path if lom.Bck is remote
 func checkRemoteMD(lom *core.LOM, e *cmn.LsoEnt) {
-	if !lom.Bucket().HasVersioningMD() {
-		debug.Assert(false, lom.Cname())
-		return
-	}
 	res := lom.CheckRemoteMD(false /*locked*/, false /*sync*/, nil /*origReq*/)
 	switch {
 	case res.Eq:
@@ -123,7 +134,7 @@ func (wi *walkInfo) callback(fqn string, de fs.DirEntry) (entry *cmn.LsoEnt, err
 	lom := core.AllocLOM("")
 	entry, err = wi._cb(lom, fqn)
 	core.FreeLOM(lom)
-	return
+	return entry, err
 }
 
 func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
@@ -151,7 +162,7 @@ func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
 	}
 
 	// shortcut #1: name-only optimizes-out loading md (NOTE: won't show misplaced and copies)
-	if wi.msg.IsFlagSet(apc.LsNameOnly) {
+	if wi.msg.IsFlagSet(apc.LsNameOnly) && !fs.HasPrefixFntl(lom.ObjName) {
 		if !isOK(status) {
 			return nil, nil
 		}
@@ -173,12 +184,16 @@ func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
 	}
 
 	if !wi.msg.IsFlagSet(apc.LsMissing) {
+		if lom.IsFntl() {
+			status = apc.LocOK // NOTE: fntl never misplaced
+			return wi.ls(lom, status), nil
+		}
 		return nil, nil
 	}
 	if local {
 		// check hrw mountpath location
 		hlom := &core.LOM{}
-		if err := hlom.InitFQN(lom.HrwFQN, lom.Bucket()); err != nil {
+		if err := hlom.InitFQN(*lom.HrwFQN, lom.Bucket()); err != nil {
 			return nil, err
 		}
 		if err := hlom.Load(true /*cache it*/, false /*locked*/); err != nil {

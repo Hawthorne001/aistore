@@ -133,6 +133,7 @@ var (
 	}
 )
 
+// TODO: prune config.ClusterConfig - hide deprecated "non_electable"
 func setCluConfigHandler(c *cli.Context) error {
 	var (
 		nvs      cos.StrKVs
@@ -208,8 +209,8 @@ func setCluConfigHandler(c *cli.Context) error {
 
 	// assorted named fields that require (cluster | node) restart
 	// for the change to take an effect
-	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired); name != "" {
-		warn := fmt.Sprintf("cluster restart required for the change '%s=%s' to take an effect.", name, nvs[name])
+	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired[:]); name != "" {
+		warn := fmt.Sprintf("cluster restart required for the change '%s=%s' to take effect.", name, nvs[name])
 		actionWarn(c, warn)
 	}
 	if err := api.SetClusterConfig(apiBP, nvs, flagIsSet(c, transientFlag)); err != nil {
@@ -248,9 +249,7 @@ func parseLogModules(v string) (string, error) {
 }
 
 // E.g.:
-// ais config cluster backend.conf='{"aws":{}}'
-// ais config cluster backend.conf '{"gcp":{}, "aws":{}}'
-// ais config cluster checksum.type='{"type":"md5"}'
+// $ ais config cluster checksum.type='{"type":"md5"}'
 func isFmtJSON(nvs cos.StrKVs) (val string, ans bool, err error) {
 	jsonRe := regexp.MustCompile(`^{.*}$`)
 	for _, v := range nvs {
@@ -357,7 +356,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 
 	// assorted named fields that'll require (cluster | node) restart
 	// for the change to take an effect
-	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired); name != "" {
+	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired[:]); name != "" {
 		warn := fmt.Sprintf("for the change '%s=%s' to take an effect node %q must be restarted.",
 			name, nvs[name], sname)
 		actionWarn(c, warn)

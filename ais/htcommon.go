@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	rdebug "runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/golang/mux"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/certloader"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
@@ -70,18 +72,11 @@ type (
 	}
 
 	// extend control msg: ActionMsg with an extra information for node <=> node control plane communications
-	aisMsg struct {
+	actMsgExt struct {
 		apc.ActMsg
 		UUID       string `json:"uuid"` // cluster-wide ID of this action (operation, transaction)
 		BMDVersion int64  `json:"bmdversion,string"`
 		RMDVersion int64  `json:"rmdversion,string"`
-	}
-
-	cleanmark struct {
-		OldVer      int64 `json:"oldver,string"`
-		NewVer      int64 `json:"newver,string"`
-		Interrupted bool  `json:"interrupted"`
-		Restarted   bool  `json:"restarted"`
 	}
 )
 
@@ -139,9 +134,9 @@ type (
 	}
 
 	networkHandler struct {
-		r   string           // resource
 		h   http.HandlerFunc // handler
-		net netAccess        // handler network access
+		r   string           // resource
+		net netAccess        // handler's network access
 	}
 
 	nodeRegPool []cluMeta
@@ -173,10 +168,11 @@ type (
 
 	// http server and http runner (common for proxy and target)
 	netServer struct {
-		sync.Mutex
 		s             *http.Server
 		muxers        httpMuxers
 		sndRcvBufSize int
+		sync.Mutex
+		lowLatencyToS bool
 	}
 
 	nlogWriter struct{}
@@ -189,10 +185,16 @@ type (
 	errBmdUUIDSplit     struct{ detail string }
 	errSmapUUIDDiffer   struct{ detail string } // ditto Smap
 	errNodeNotFound     struct {
+		si   *meta.Snode // self
+		smap *smapX
 		msg  string
 		id   string
+	}
+	errSelfNotFound struct {
 		si   *meta.Snode
 		smap *smapX
+		act  string
+		tag  string
 	}
 	errNotEnoughTargets struct {
 		si       *meta.Snode
@@ -213,7 +215,7 @@ type (
 	}
 )
 
-var allHTTPverbs = []string{
+var htverbs = [...]string{
 	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
 	http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
 }
@@ -223,6 +225,7 @@ var (
 	errForwarded         = errors.New("forwarded")
 	errSendingResp       = errors.New("err-sending-resp")
 	errFastKalive        = errors.New("cannot fast-keepalive")
+	errIntraControl      = errors.New("expected intra-control request")
 )
 
 // BMD uuid errs
@@ -234,6 +237,9 @@ func (e *errPrxBmdUUIDDiffer) Error() string { return e.detail }
 func (e *errSmapUUIDDiffer) Error() string   { return e.detail }
 func (e *errNodeNotFound) Error() string {
 	return fmt.Sprintf("%s: %s node %s not present in the %s", e.si, e.msg, e.id, e.smap)
+}
+func (e *errSelfNotFound) Error() string {
+	return fmt.Sprintf("%s: %s failure: not finding self in the %s %s", e.si, e.act, e.tag, e.smap.StringEx())
 }
 
 /////////////////////
@@ -412,8 +418,13 @@ var (
 	_ cresv = cresBsumm{}
 )
 
-func (res *callResult) read(body io.Reader)  { res.bytes, res.err = io.ReadAll(body) }
-func (res *callResult) jread(body io.Reader) { res.err = jsoniter.NewDecoder(body).Decode(res.v) }
+func (res *callResult) read(body io.Reader, size int64) {
+	res.bytes, res.err = cos.ReadAllN(body, size)
+}
+
+func (res *callResult) jread(body io.Reader) {
+	res.err = jsoniter.NewDecoder(body).Decode(res.v)
+}
 
 func (res *callResult) mread(body io.Reader) {
 	vv, ok := res.v.(msgp.Decodable)
@@ -483,50 +494,44 @@ func (*nlogWriter) Write(p []byte) (int, error) {
 // Override muxer ServeHTTP to support proxying HTTPS requests. Clients
 // initiate all HTTPS requests with CONNECT method instead of GET/PUT etc.
 func (server *netServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// plain
 	if r.Method != http.MethodConnect {
 		server.muxers.ServeHTTP(w, r)
 		return
 	}
 
-	// TODO: add support for caching HTTPS requests
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	// HTTPS
+	destConn, err := net.DialTimeout("tcp", r.Host, cmn.DfltDialupTimeout)
 	if err != nil {
 		cmn.WriteErr(w, r, err, http.StatusServiceUnavailable)
 		return
 	}
 
-	// Second, hijack the connection. A kind of man-in-the-middle attack
-	// From this point on, this function is responsible for HTTP connection
+	// hijack the connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		cmn.WriteErr(w, r, errors.New("response writer does not support hijacking"),
-			http.StatusInternalServerError)
+		cmn.WriteErr(w, r, errors.New("response writer does not support hijacking"), http.StatusInternalServerError)
 		return
 	}
 
-	// First, send that everything is OK. Trying to write a header after
-	// hijacking generates a warning and nothing works
 	w.WriteHeader(http.StatusOK)
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		// NOTE: cannot send error because we have already written a header.
 		nlog.Errorln(err)
 		return
 	}
 
-	// Third, start transparently sending data between source and destination
-	// by creating a tunnel between them
-	transfer := func(destination io.WriteCloser, source io.ReadCloser) {
-		io.Copy(destination, source)
-		source.Close()
-		destination.Close()
-	}
+	// send/receive both ways (bi-directional tunnel)
+	// (one of those close() calls will fail, the one that loses the race)
+	go _copy(destConn, clientConn)
+	go _copy(clientConn, destConn)
+}
 
-	// NOTE: it looks like double closing both connections.
-	// Need to check how the tunnel works
-	go transfer(destConn, clientConn)
-	go transfer(clientConn, destConn)
+func _copy(destination io.WriteCloser, source io.ReadCloser) {
+	io.Copy(destination, source)
+	source.Close()
+	destination.Close()
 }
 
 func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Config, config *cmn.Config) (err error) {
@@ -545,15 +550,19 @@ func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Co
 	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
 		server.s.ReadHeaderTimeout = timeout
 	}
-	if server.sndRcvBufSize > 0 && !config.Net.HTTP.UseHTTPS {
-		server.s.ConnState = server.connStateListener // setsockopt; see also cmn.NewTransport
+
+	// set sock options on the server side; NOTE https exclusion
+	if (server.sndRcvBufSize > 0 || server.lowLatencyToS) && !config.Net.HTTP.UseHTTPS {
+		server.s.ConnState = server.connStateListener
 	}
+
 	server.s.TLSConfig = tlsConf
 	server.Unlock()
 retry:
 	if config.Net.HTTP.UseHTTPS {
 		tag = "HTTPS"
-		err = server.s.ListenAndServeTLS(config.Net.HTTP.Certificate, config.Net.HTTP.CertKey)
+		// Listen and Serve TLS using certificates provided using the GetCertificate() instead of static files.
+		err = server.s.ListenAndServeTLS("", "")
 	} else {
 		err = server.s.ListenAndServe()
 	}
@@ -576,17 +585,32 @@ func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
 		caCert     []byte
 		clientAuth = tls.ClientAuthType(conf.ClientAuthTLS)
 	)
+	tlsConf = &tls.Config{
+		ClientAuth: clientAuth,
+	}
 	if clientAuth > tls.RequestClientCert {
 		if caCert, err = os.ReadFile(conf.ClientCA); err != nil {
-			return
+			return nil, fmt.Errorf("new-tls: failed to read PEM %q, err: %w", conf.ClientCA, err)
 		}
-		pool = x509.NewCertPool()
+
+		// from https://github.com/golang/go/blob/master/src/crypto/x509/cert_pool.go:
+		// "On Unix systems other than macOS the environment variables SSL_CERT_FILE and
+		// SSL_CERT_DIR can be used to override the system default locations for the SSL
+		// certificate file and SSL certificate files directory, respectively. The
+		// latter can be a colon-separated list."
+		pool, err = x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("new-tls: failed to load system cert pool, err: %w", err)
+		}
 		if ok := pool.AppendCertsFromPEM(caCert); !ok {
-			return nil, fmt.Errorf("tls: failed to append CA certs from PEM: %q", conf.ClientCA)
+			return nil, fmt.Errorf("new-tls: failed to append CA certs from PEM %q", conf.ClientCA)
 		}
+		tlsConf.ClientCAs = pool
 	}
-	tlsConf = &tls.Config{ClientAuth: clientAuth, ClientCAs: pool}
-	return
+	if conf.Certificate != "" && conf.CertKey != "" {
+		tlsConf.GetCertificate, err = certloader.GetCert()
+	}
+	return tlsConf, err
 }
 
 func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
@@ -594,10 +618,14 @@ func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
 		return
 	}
 	tcpconn, ok := c.(*net.TCPConn)
-	cos.Assert(ok)
-	rawconn, _ := tcpconn.SyscallConn()
-	args := cmn.TransportArgs{SndRcvBufSize: server.sndRcvBufSize}
-	rawconn.Control(args.ConnControl(rawconn))
+	debug.Assert(ok)
+	rawconn, err := tcpconn.SyscallConn()
+	if err != nil {
+		nlog.Errorln("FATAL tcpconn.SyscallConn err:", err) // (unlikely)
+		return
+	}
+	args := cmn.TransportArgs{SndRcvBufSize: server.sndRcvBufSize, LowLatencyToS: server.lowLatencyToS}
+	args.ServerControl(rawconn)
 }
 
 func (server *netServer) shutdown(config *cmn.Config) {
@@ -608,7 +636,7 @@ func (server *netServer) shutdown(config *cmn.Config) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout.MaxHostBusy.D())
 	if err := server.s.Shutdown(ctx); err != nil {
-		nlog.Infoln("http server shutdown err:", err)
+		nlog.Warningln("http server shutdown err:", err)
 	}
 	cancel()
 }
@@ -620,10 +648,10 @@ func (server *netServer) shutdown(config *cmn.Config) {
 // interface guard
 var _ http.Handler = (*httpMuxers)(nil)
 
-func newMuxers() httpMuxers {
-	m := make(httpMuxers, len(allHTTPverbs))
-	for _, v := range allHTTPverbs {
-		m[v] = mux.NewServeMux()
+func newMuxers(enableTracing bool) httpMuxers {
+	m := make(httpMuxers, len(htverbs))
+	for _, v := range htverbs {
+		m[v] = mux.NewServeMux(enableTracing)
 	}
 	return m
 }
@@ -654,15 +682,19 @@ func (p *proxy) fillNsti(nsti *cos.NodeStateInfo) {
 func (t *target) fillNsti(nsti *cos.NodeStateInfo) {
 	t.htrun.fill(nsti)
 	marked := xreg.GetRebMarked()
-	if marked.Xact != nil {
+
+	// (running | interrupted | ok)
+	if xreb := marked.Xact; xreb != nil {
 		nsti.Flags = nsti.Flags.Set(cos.Rebalancing)
-	}
-	if marked.Interrupted {
+	} else if marked.Interrupted {
 		nsti.Flags = nsti.Flags.Set(cos.RebalanceInterrupted)
 	}
+
+	// node restarted
 	if marked.Restarted {
-		nsti.Flags = nsti.Flags.Set(cos.Restarted)
+		nsti.Flags = nsti.Flags.Set(cos.NodeRestarted)
 	}
+
 	marked = xreg.GetResilverMarked()
 	if marked.Xact != nil {
 		nsti.Flags = nsti.Flags.Set(cos.Resilvering)
@@ -712,7 +744,7 @@ func (smap *smapX) fill(nsti *cos.NodeStateInfo) {
 
 func (c *getMaxCii) do(si *meta.Snode, wg cos.WG, smap *smapX) {
 	var nsti *cos.NodeStateInfo
-	body, _, err := c.h.reqHealth(si, c.timeout, c.query, smap)
+	body, _, err := c.h.reqHealth(si, c.timeout, c.query, smap, false /*retry pub-addr*/)
 	if err != nil {
 		goto ret
 	}
@@ -818,6 +850,13 @@ func apiReqFree(a *apiRequest) {
 // misc helpers
 //
 
+// http response: xaction ID most of the time but may be any string
+func writeXid(w http.ResponseWriter, xid string) {
+	debug.Assert(xid != "")
+	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(xid)))
+	w.Write(cos.UnsafeB(xid))
+}
+
 func newBckFromQ(bckName string, query url.Values, dpq *dpq) (*meta.Bck, error) {
 	bck := _bckFromQ(bckName, query, dpq)
 	normp, err := cmn.NormalizeProvider(bck.Provider)
@@ -859,7 +898,7 @@ func newBckFromQuname(query url.Values, required bool) (*meta.Bck, error) {
 	}
 	bck, objName := cmn.ParseUname(uname)
 	if objName != "" {
-		return nil, fmt.Errorf("bucket %s: unexpected non-empty object name %q", bck, objName)
+		return nil, fmt.Errorf("bucket %s: not expecting object name (got %q)", bck.String(), objName)
 	}
 	if err := bck.Validate(); err != nil {
 		return nil, err

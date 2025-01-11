@@ -21,7 +21,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
@@ -121,7 +120,8 @@ func (*lruFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 
 func (p *lruFactory) Start() error {
 	p.xctn = &XactLRU{}
-	p.xctn.InitBase(p.UUID(), apc.ActLRU, nil)
+	ctlmsg := p.Args.Custom.(string)
+	p.xctn.InitBase(p.UUID(), apc.ActLRU, ctlmsg, nil)
 	return nil
 }
 
@@ -134,12 +134,12 @@ func (*lruFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, er
 
 func RunLRU(ini *IniLRU) {
 	var (
-		xlru           = ini.Xaction
-		config         = cmn.GCO.Get()
-		availablePaths = fs.GetAvail()
-		num            = len(availablePaths)
-		joggers        = make(map[string]*lruJ, num)
-		parent         = &lruP{joggers: joggers, ini: *ini}
+		xlru    = ini.Xaction
+		config  = cmn.GCO.Get()
+		avail   = fs.GetAvail()
+		num     = len(avail)
+		joggers = make(map[string]*lruJ, num)
+		parent  = &lruP{joggers: joggers, ini: *ini}
 	)
 	defer func() {
 		if ini.WG != nil {
@@ -151,7 +151,7 @@ func RunLRU(ini *IniLRU) {
 		xlru.Finish()
 		return
 	}
-	for mpath, mi := range availablePaths {
+	for mpath, mi := range avail {
 		h := make(minHeap, 0, 64)
 		joggers[mpath] = &lruJ{
 			heap:   &h,
@@ -260,7 +260,7 @@ func (j *lruJ) jogBcks(bcks []cmn.Bck, force bool) (err error) {
 		var size int64
 		j.bck = bck
 		if j.allowDelObj, err = j.allow(); err != nil {
-			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck)
+			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck.String())
 			err = nil
 			continue
 		}
@@ -334,7 +334,7 @@ func (j *lruJ) _visit(lom *core.LOM) (pushed bool) {
 		return
 	}
 	heap.Push(j.heap, lom)
-	j.curSize += lom.SizeBytes()
+	j.curSize += lom.Lsize()
 	if lom.AtimeUnix() > j.newest {
 		j.newest = lom.AtimeUnix()
 	}
@@ -374,7 +374,7 @@ func (j *lruJ) evict() (size int64, err error) {
 			core.FreeLOM(lom)
 			continue
 		}
-		objSize := lom.SizeBytes(true /*not loaded*/)
+		objSize := lom.Lsize(true /*not loaded*/)
 		core.FreeLOM(lom)
 		bevicted += objSize
 		size += objSize
@@ -412,18 +412,19 @@ func (j *lruJ) postRemove(prev, size int64) (capCheck int64, err error) {
 }
 
 func (j *lruJ) _throttle(usedPct int64) (err error) {
-	if j.mi.IsIdle(j.config) {
+	if u := j.mi.GetUtil(); u >= 0 && u < j.config.Disk.DiskUtilLowWM {
 		return
 	}
-	// throttle self
-	ratioCapacity := cos.Ratio(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
-	curr := fs.GetMpathUtil(j.mi.Path)
-	ratioUtilization := cos.Ratio(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
-	if ratioUtilization > ratioCapacity {
+	var (
+		ratioCap  = cos.RatioPct(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
+		curr      = fs.GetMpathUtil(j.mi.Path)
+		ratioUtil = cos.RatioPct(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
+	)
+	if ratioUtil > ratioCap {
 		if usedPct < (j.config.Space.LowWM+j.config.Space.HighWM)/2 {
 			j.throttle = true
 		}
-		time.Sleep(mpather.ThrottleMaxDur)
+		time.Sleep(fs.Throttle100ms)
 		err = j.yieldTerm()
 	}
 	return
@@ -432,14 +433,14 @@ func (j *lruJ) _throttle(usedPct int64) (err error) {
 // remove local copies that "belong" to different LRU joggers (space accounting may be temporarily not precise)
 func (j *lruJ) evictObj(lom *core.LOM) bool {
 	lom.Lock(true)
-	err := lom.Remove()
+	err := lom.RemoveObj()
 	lom.Unlock(true)
 	if err != nil {
 		nlog.Errorf("%s: failed to evict %s: %v", j, lom, err)
 		return false
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleSpace) {
-		nlog.Infof("%s: evicted %s, size=%d", j, lom, lom.SizeBytes(true /*not loaded*/))
+		nlog.Infof("%s: evicted %s, size=%d", j, lom, lom.Lsize(true /*not loaded*/))
 	}
 	return true
 }
@@ -469,7 +470,7 @@ func (j *lruJ) yieldTerm() error {
 		return cmn.NewErrAborted(xlru.Name(), "", nil)
 	default:
 		if j.throttle {
-			time.Sleep(mpather.ThrottleMinDur)
+			time.Sleep(fs.Throttle1ms)
 		}
 		break
 	}

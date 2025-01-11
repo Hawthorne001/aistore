@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,13 +41,14 @@ type (
 		streamingF
 	}
 	archwi struct { // archival work item; implements lrwi
+		j       *jogger
 		writer  archive.Writer
 		r       *XactArch
 		msg     *cmn.ArchiveBckMsg
 		tsi     *meta.Snode
 		archlom *core.LOM
-		fqn     string   // workFQN --/--
-		wfh     *os.File // --/--
+		fqn     string        // workFQN --/--
+		wfh     cos.LomWriter // -> workFQN
 		cksum   cos.CksumHashSize
 		cnt     atomic.Int32 // num archived
 		// tar only
@@ -55,10 +57,23 @@ type (
 		// finishing
 		refc atomic.Int32
 	}
+	archtask struct {
+		wi   *archwi
+		lrit *lrit
+	}
+	jogger struct {
+		mpath  *fs.Mountpath
+		workCh chan *archtask
+		stopCh cos.StopCh
+	}
 	XactArch struct {
 		streamingX
-		workCh  chan *cmn.ArchiveBckMsg
 		bckTo   *meta.Bck
+		joggers struct {
+			wg sync.WaitGroup
+			m  map[string]*jogger
+			sync.RWMutex
+		}
 		pending struct {
 			m map[string]*archwi
 			sync.RWMutex
@@ -98,11 +113,12 @@ func (p *archFactory) Start() (err error) {
 	//
 	// new x-archive
 	//
-	workCh := make(chan *cmn.ArchiveBckMsg, maxNumInParallel)
-	r := &XactArch{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}, workCh: workCh}
+	r := &XactArch{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}}
 	r.pending.m = make(map[string]*archwi, maxNumInParallel)
+	avail := fs.GetAvail()
+	r.joggers.m = make(map[string]*jogger, len(avail))
 	p.xctn = r
-	r.DemandBase.Init(p.UUID() /*== p.Args.UUID above*/, p.kind, p.Bck /*from*/, xact.IdleDefault)
+	r.DemandBase.Init(p.UUID(), p.kind, "" /*delay ctlmsg until Do()*/, p.Bck /*from*/, xact.IdleDefault)
 
 	if err := p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, cmn.OwtPut, 0 /*pdu*/); err != nil {
 		return err
@@ -133,7 +149,7 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) 
 	// here and elsewhere: an extra check to make sure this target is active (ref: ignoreMaintenance)
 	smap := core.T.Sowner().Get()
 	if err = core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
-		return
+		return err
 	}
 	nat := smap.CountActiveTs()
 	wi.refc.Store(int32(nat - 1))
@@ -141,41 +157,66 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) 
 	wi.tsi, err = smap.HrwName2T(msg.ToBck.MakeUname(msg.ArchName))
 	if err != nil {
 		r.AddErr(err, 4, cos.SmoduleXs)
-		return
+		return err
 	}
+
+	// bind a new/existing jogger to this archwi based on archlom's mountpath
+	var (
+		mpath  = archlom.Mountpath()
+		exists bool
+	)
+	r.joggers.Lock()
+	if wi.j, exists = r.joggers.m[mpath.Path]; !exists {
+		r.joggers.m[mpath.Path] = &jogger{
+			mpath:  mpath,
+			workCh: make(chan *archtask, maxNumInParallel*2),
+		}
+		wi.j = r.joggers.m[mpath.Path]
+		wi.j.stopCh.Init()
+		r.joggers.wg.Add(1)
+		go func() {
+			wi.j.run()
+			r.joggers.wg.Done()
+		}()
+	}
+	r.joggers.Unlock()
 
 	// fcreate at BEGIN time
 	if core.T.SID() == wi.tsi.ID() {
 		var (
-			s           string
-			lmfh        *os.File
-			finfo, errX = os.Stat(wi.archlom.FQN)
-			exists      = errX == nil
+			s    string
+			lmfh cos.LomReader
 		)
-		if exists && wi.msg.AppendIfExists {
-			s = " append"
-			lmfh, err = wi.beginAppend()
+		if !wi.msg.AppendIfExists {
+			wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
+		} else if errX := wi.archlom.Load(false, false); errX == nil {
+			if !wi.archlom.IsChunked() {
+				s = " append"
+				lmfh, err = wi.beginAppend()
+			} else {
+				wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
+			}
 		} else {
-			wi.wfh, err = wi.archlom.CreateFile(wi.fqn)
+			wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
 		}
 		if err != nil {
-			return
+			return err
 		}
 		if cmn.Rom.FastV(5, cos.SmoduleXs) {
 			nlog.Infof("%s: begin%s %s", r.Base.Name(), s, msg.Cname())
 		}
 
 		// construct format-specific writer; serialize for multi-target conc. writing
-		opts := archive.Opts{Serialize: nat > 1, TarFormat: wi.tarFormat}
+		opts := archive.Opts{Serialize: true, TarFormat: wi.tarFormat}
 		wi.writer = archive.NewWriter(msg.Mime, wi.wfh, &wi.cksum, &opts)
 
 		// append case (above)
 		if lmfh != nil {
-			err = wi.writer.Copy(lmfh, finfo.Size())
+			err = wi.writer.Copy(lmfh, wi.archlom.Lsize())
 			if err != nil {
 				wi.writer.Fini()
 				wi.cleanup()
-				return
+				return err
 			}
 		}
 	}
@@ -191,65 +232,82 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) 
 	r.pending.m[msg.TxnUUID] = wi
 	r.wiCnt.Inc()
 	r.pending.Unlock()
-	return
+	return nil
 }
 
 func (r *XactArch) Do(msg *cmn.ArchiveBckMsg) {
 	r.IncPending()
-	r.workCh <- msg
+	r.pending.RLock()
+	wi, ok := r.pending.m[msg.TxnUUID]
+	r.pending.RUnlock()
+	if !ok || wi == nil {
+		// NOTE: unexpected and unlikely - aborting
+		debug.Assert(r.ErrCnt() > 0) // see cleanup
+		r.Abort(r.Err())
+		r.DecPending()
+		r.cleanup()
+		return
+	}
+
+	// lrpWorkersNone since we need a single writer to serialize adding files
+	// into an eventual `archlom`
+	lrit := &lrit{}
+	err := lrit.init(r, &msg.ListRange, r.Bck(), lrpWorkersNone)
+	if err != nil {
+		r.Abort(err)
+		r.DecPending()
+		r.cleanup()
+		return
+	}
+
+	// dynamic ctlmsg // TODO: ref
+	{
+		var sb strings.Builder
+		sb.Grow(80)
+		sb.WriteString(r.Bck().Cname(""))
+		if r.bckTo != nil && !r.bckTo.IsEmpty() {
+			sb.WriteString("=>")
+			sb.WriteString(r.bckTo.Cname(""))
+		}
+		sb.WriteByte(' ')
+		msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
+		if msg.BaseNameOnly {
+			sb.WriteString(", basename-only")
+		}
+		if msg.InclSrcBname {
+			sb.WriteString(", incl-src-basename")
+		}
+		if msg.AppendIfExists {
+			sb.WriteString(", append-iff")
+		}
+
+		r.Base.SetCtlMsg(sb.String())
+	}
+
+	if r.IsAborted() {
+		return
+	}
+
+	wi.j.workCh <- &archtask{wi, lrit}
+	if r.Err() != nil {
+		wi.cleanup()
+		r.Abort(r.Err())
+		r.cleanup()
+	}
 }
 
 func (r *XactArch) Run(wg *sync.WaitGroup) {
-	var err error
 	nlog.Infoln(r.Name())
 	wg.Done()
-	for {
-		select {
-		case msg := <-r.workCh:
-			r.pending.RLock()
-			wi, ok := r.pending.m[msg.TxnUUID]
-			r.pending.RUnlock()
-			if !ok {
-				debug.Assert(r.ErrCnt() > 0) // see cleanup
-				goto fin
-			}
-			var (
-				smap = core.T.Sowner().Get()
-				lrit = &lriterator{}
-			)
-			err = lrit.init(r, &msg.ListRange, r.Bck(), true /*TODO: remove blocking*/)
-			if err != nil {
-				r.Abort(err)
-				goto fin
-			}
-			err = lrit.run(wi, smap)
-			if err != nil {
-				r.AddErr(err)
-			}
-			lrit.wait()
-			if r.Err() != nil {
-				wi.cleanup()
-				goto fin
-			}
-			if core.T.SID() == wi.tsi.ID() {
-				go r.finalize(wi) // async finalize this shard
-			} else {
-				r.sendTerm(wi.msg.TxnUUID, wi.tsi, nil)
-				r.pending.Lock()
-				delete(r.pending.m, msg.TxnUUID)
-				r.wiCnt.Dec()
-				r.pending.Unlock()
-				r.DecPending()
-
-				core.FreeLOM(wi.archlom)
-			}
-		case <-r.IdleTimer():
-			goto fin
-		case <-r.ChanAbort():
-			goto fin
-		}
+	select {
+	case <-r.IdleTimer():
+		r.cleanup()
+	case <-r.ChanAbort():
+		r.cleanup()
 	}
-fin:
+}
+
+func (r *XactArch) cleanup() {
 	r.streamingX.fin(true /*unreg Rx*/)
 	if r.Err() == nil {
 		return
@@ -262,6 +320,14 @@ fin:
 	}
 	clear(r.pending.m)
 	r.pending.Unlock()
+
+	r.joggers.Lock()
+	for _, jogger := range r.joggers.m {
+		jogger.stopCh.Close()
+	}
+	clear(r.joggers.m)
+	r.joggers.Unlock()
+	r.joggers.wg.Wait()
 }
 
 func (r *XactArch) doSend(lom *core.LOM, wi *archwi, fh cos.ReadOpenCloser) {
@@ -300,7 +366,10 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 			return nil
 		}
 		cnt, err := r.JoinErr()
-		debug.Assert(cnt > 0) // see cleanup
+		if cnt == 0 { // see cleanup
+			err = fmt.Errorf("%s: recv: failed to begin(?)", r.Name())
+			nlog.Errorln(err)
+		}
 		return err
 	}
 	debug.Assert(wi.tsi.ID() == core.T.SID() && wi.msg.TxnUUID == cos.UnsafeS(hdr.Opaque))
@@ -335,7 +404,7 @@ func (r *XactArch) finalize(wi *archwi) {
 	r.wiCnt.Dec()
 	r.pending.Unlock()
 
-	ecode, err := r.fini(wi)
+	ecode, err := r._fini(wi)
 	r.DecPending()
 	if cmn.Rom.FastV(5, cos.SmoduleXs) {
 		var s string
@@ -353,7 +422,7 @@ func (r *XactArch) finalize(wi *archwi) {
 	r.AddErr(err, 5, cos.SmoduleXs)
 }
 
-func (r *XactArch) fini(wi *archwi) (ecode int, err error) {
+func (r *XactArch) _fini(wi *archwi) (ecode int, err error) {
 	wi.writer.Fini()
 
 	if r.IsAborted() {
@@ -382,14 +451,13 @@ func (r *XactArch) fini(wi *archwi) (ecode int, err error) {
 		ecode = http.StatusInternalServerError
 		return
 	}
+	debug.Assert(wi.wfh == nil)
 
 	wi.archlom.SetSize(size)
-	cos.Close(wi.wfh)
-	wi.wfh = nil
-
 	ecode, err = core.T.FinalizeObj(wi.archlom, wi.fqn, r, cmn.OwtArchive)
 	core.FreeLOM(wi.archlom)
 	r.ObjsAdd(1, size-wi.appendPos)
+
 	return
 }
 
@@ -428,57 +496,89 @@ func (r *XactArch) Snap() (snap *core.Snap) {
 }
 
 ////////////
-// archwi //
+// jogger //
 ////////////
 
-func (wi *archwi) beginAppend() (lmfh *os.File, err error) {
-	msg := wi.msg
-	if msg.Mime == archive.ExtTar {
-		if err = wi.openTarForAppend(); err == nil || err != archive.ErrTarIsEmpty {
+func (j *jogger) run() {
+	nlog.Infoln("jogger started in mount path", j.mpath)
+	for {
+		select {
+		case archtask := <-j.workCh:
+			lrit, wi := archtask.lrit, archtask.wi
+			smap := core.T.Sowner().Get()
+			err := lrit.run(wi, smap)
+			if err != nil {
+				wi.r.AddErr(err)
+			}
+
+			lrit.wait()
+			if core.T.SID() == wi.tsi.ID() {
+				go wi.r.finalize(wi) // async finalize this shard
+			} else {
+				wi.r.sendTerm(wi.msg.TxnUUID, wi.tsi, nil)
+				wi.r.pending.Lock()
+				delete(wi.r.pending.m, wi.msg.TxnUUID)
+				wi.r.wiCnt.Dec()
+				wi.r.pending.Unlock()
+				wi.r.DecPending()
+
+				core.FreeLOM(wi.archlom)
+			}
+		case <-j.stopCh.Listen():
 			return
 		}
 	}
-	// msg.Mime has been already validated (see ais/* for apc.ActArchive)
-	// prep to copy `lmfh` --> `wi.fh` with subsequent APPEND-ing
-	lmfh, err = wi.archlom.OpenFile()
-	if err != nil {
-		return
+}
+
+////////////
+// archwi //
+////////////
+
+func (wi *archwi) beginAppend() (lmfh cos.LomReader, err error) {
+	msg := wi.msg
+	if msg.Mime == archive.ExtTar {
+		err = wi.openTarForAppend()
+		if err == nil /*can append*/ || err != archive.ErrTarIsEmpty /*fail XactArch.Begin*/ {
+			return nil, err
+		}
 	}
-	if wi.wfh, err = wi.archlom.CreateFile(wi.fqn); err != nil {
+
+	// <extra copy>
+	// prep to copy `lmfh` --> `wi.fh` with subsequent APPEND-ing
+	// msg.Mime has been already validated (see ais/* for apc.ActArchive)
+	lmfh, err = wi.archlom.Open()
+	if err != nil {
+		return nil, err
+	}
+	if wi.wfh, err = wi.archlom.CreateWork(wi.fqn); err != nil {
 		cos.Close(lmfh)
 		lmfh = nil
 	}
-	return
+	return lmfh, err
 }
 
 func (wi *archwi) openTarForAppend() (err error) {
-	if err = os.Rename(wi.archlom.FQN, wi.fqn); err != nil {
-		return
+	if err = wi.archlom.RenameMainTo(wi.fqn); err != nil {
+		return err
 	}
 	// open (rw) lom itself
-	wi.wfh, wi.tarFormat, err = archive.OpenTarSeekEnd(wi.archlom.ObjName, wi.fqn)
-	if err != nil {
-		goto roll
-	}
-	wi.appendPos, err = wi.wfh.Seek(0, io.SeekCurrent)
+	wi.wfh, wi.tarFormat, wi.appendPos, err = archive.OpenTarForAppend(wi.archlom.Cname(), wi.fqn)
 	if err == nil {
-		return // can append
+		return nil // can append
 	}
-	wi.appendPos, wi.tarFormat = 0, tar.FormatUnknown // reset
-	cos.Close(wi.wfh)
-	wi.wfh = nil
-roll:
-	if errV := wi.archlom.RenameFrom(wi.fqn); errV != nil {
+
+	// back
+	if errV := wi.archlom.RenameToMain(wi.fqn); errV != nil {
 		nlog.Errorf("%s: nested error: failed to append %s (%v) and rename back from %s (%v)",
 			wi.tsi, wi.archlom, err, wi.fqn, errV)
 	} else {
 		wi.fqn = ""
 	}
-	return
+	return err
 }
 
 // multi-object iterator i/f: "handle work item"
-func (wi *archwi) do(lom *core.LOM, lrit *lriterator) {
+func (wi *archwi) do(lom *core.LOM, lrit *lrit) {
 	var coldGet bool
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
 		if !cos.IsNotExist(err, 0) {
@@ -514,7 +614,13 @@ func (wi *archwi) do(lom *core.LOM, lrit *lriterator) {
 		wi.r.doSend(lom, wi, fh)
 		return
 	}
-	debug.Assert(wi.wfh != nil) // see Begin
+	// see Begin
+	if wi.wfh == nil {
+		// NOTE: unexpected and unlikely - aborting
+		err = fmt.Errorf("%s: destination %q does not exist (not open)", wi.r.Name(), wi.fqn)
+		wi.r.Abort(err)
+		return
+	}
 	err = wi.writer.Write(wi.nameInArch(lom.ObjName), lom, fh /*reader*/)
 	cos.Close(fh)
 	if err == nil {
@@ -535,6 +641,9 @@ func (wi *archwi) quiesce() core.QuiRes {
 }
 
 func (wi *archwi) nameInArch(objName string) string {
+	if wi.msg.BaseNameOnly {
+		objName = filepath.Base(objName)
+	}
 	if !wi.msg.InclSrcBname {
 		return objName
 	}
@@ -559,16 +668,23 @@ func (wi *archwi) cleanup() {
 }
 
 func (wi *archwi) finalize() (int64, error) {
+	err := wi.wfh.Close()
+	wi.wfh = nil
+	if err != nil {
+		debug.AssertNoErr(err)
+		return 0, err
+	}
+	// tar append
 	if wi.appendPos > 0 {
-		size, err := wi.wfh.Seek(0, io.SeekCurrent)
+		finfo, err := os.Stat(wi.fqn)
 		if err != nil {
+			debug.AssertNoErr(err)
 			return 0, err
 		}
-		debug.Assertf(size > wi.appendPos, "%d vs %d", size, wi.appendPos)
-		// checksum traded off
-		wi.archlom.SetCksum(cos.NewCksum(cos.ChecksumNone, ""))
-		return size, nil
+		wi.archlom.SetCksum(cos.NewCksum(cos.ChecksumNone, "")) // TODO: checksum NIY
+		return finfo.Size(), nil
 	}
+	// default
 	wi.cksum.Finalize()
 	wi.archlom.SetCksum(&wi.cksum.Cksum)
 	return wi.cksum.Size, nil

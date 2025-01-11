@@ -19,9 +19,12 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tracing"
 	jsoniter "github.com/json-iterator/go"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
@@ -60,16 +63,15 @@ var (
 	_ core.Backend = (*gsbp)(nil)
 )
 
-func NewGCP(t core.TargetPut) (bp core.Backend, err error) {
+func NewGCP(t core.TargetPut, tstats stats.Tracker, startingUp bool) (_ core.Backend, err error) {
 	var (
 		projectID     string
 		credProjectID = readCredFile()
 		envProjectID  = os.Getenv(projectIDEnvVar)
 	)
 	if credProjectID != "" && envProjectID != "" && credProjectID != envProjectID {
-		err = fmt.Errorf("both %q and %q env vars cannot be defined (and not equal %s)",
+		return nil, fmt.Errorf("both %q and %q env vars cannot be defined (and not equal %s)",
 			projectIDEnvVar, credPathEnvVar, projectIDField)
-		return
 	}
 	switch {
 	case credProjectID != "":
@@ -81,17 +83,22 @@ func NewGCP(t core.TargetPut) (bp core.Backend, err error) {
 	default:
 		nlog.Warningln("unauthenticated client")
 	}
-	gsbp := &gsbp{
+
+	bp := &gsbp{
 		t:         t,
 		projectID: projectID,
-		base:      base{apc.GCP},
+		base:      base{provider: apc.GCP},
 	}
-	bp = gsbp
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
 
 	gctx = context.Background()
-	gcpClient, err = gsbp.createClient(gctx)
-	return
+	gcpClient, err = bp.createClient(gctx)
+
+	return bp, err
 }
+
+// TODO: use config.Net.HTTP.IdleConnTimeout and friends
 
 func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 	opts := []option.ClientOption{option.WithScopes(storage.ScopeFullControl)}
@@ -108,7 +115,7 @@ func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 		}
 		return nil, cmn.NewErrFailedTo(nil, "gcp-backend: create", "http transport", err)
 	}
-	opts = append(opts, option.WithHTTPClient(&http.Client{Transport: transport}))
+	opts = append(opts, option.WithHTTPClient(tracing.NewTraceableClient(&http.Client{Transport: transport})))
 	// create HTTP client
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
@@ -157,14 +164,12 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 
 	if prefix := msg.Prefix; prefix != "" {
-		var delim string
+		query = &storage.Query{Prefix: prefix}
 		if msg.IsFlagSet(apc.LsNoRecursion) {
-			// NOTE: important to indicate subdirectory with trailing '/'
-			if cos.IsLastB(prefix, '/') {
-				delim = "/"
-			}
+			query.Delimiter = "/"
 		}
-		query = &storage.Query{Prefix: prefix, Delimiter: delim}
+	} else if msg.IsFlagSet(apc.LsNoRecursion) {
+		query = &storage.Query{Delimiter: "/"}
 	}
 
 	var (
@@ -184,48 +189,37 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	lst.ContinuationToken = nextPageToken
 
 	var (
-		custom     cos.StrKVs
-		i          int
-		l          = len(objs)
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
 	)
-	for j := len(lst.Entries); j < l; j++ {
-		lst.Entries = append(lst.Entries, &cmn.LsoEnt{}) // add missing empty
-	}
-	if wantCustom {
-		custom = make(cos.StrKVs, 3) // reuse
-	}
+	lst.Entries = lst.Entries[:0]
 	for _, attrs := range objs {
-		if msg.IsFlagSet(apc.LsNoRecursion) {
-			if attrs.Name == "" {
-				entry := lst.Entries[i]
-				entry.Name = attrs.Prefix
-				entry.Flags = apc.EntryIsDir
-				i++
+		en := cmn.LsoEnt{Name: attrs.Name, Size: attrs.Size}
+		if attrs.Prefix != "" {
+			// see "Prefix"
+			// ref: https://github.com/googleapis/google-cloud-go/blob/main/storage/storage.go#L1407-L1411
+			debug.Assert(attrs.Name == "", attrs.Prefix, " vs ", attrs.Name)
+			debug.Assert(query != nil && query.Delimiter != "")
+
+			if msg.IsFlagSet(apc.LsNoDirs) { // do not return virtual subdirectories
 				continue
 			}
+			en.Name = attrs.Prefix
+			en.Flags = apc.EntryIsDir
+		} else if !msg.IsFlagSet(apc.LsNameOnly) && !msg.IsFlagSet(apc.LsNameSize) {
+			if v, ok := h.EncodeCksum(attrs.MD5); ok {
+				en.Checksum = v
+			}
+			if v, ok := h.EncodeVersion(attrs.Generation); ok {
+				en.Version = v
+			}
+			if wantCustom {
+				etag, _ := h.EncodeETag(attrs.Etag)
+				en.Custom = cmn.CustomProps2S(cmn.ETag, etag, cmn.LastModified, fmtTime(attrs.Updated),
+					cos.HdrContentType, attrs.ContentType)
+			}
 		}
-		entry := lst.Entries[i]
-		i++
-		entry.Name, entry.Size = attrs.Name, attrs.Size
-		if msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize) {
-			continue
-		}
-		if v, ok := h.EncodeCksum(attrs.MD5); ok {
-			entry.Checksum = v
-		}
-		if v, ok := h.EncodeVersion(attrs.Generation); ok {
-			entry.Version = v
-		}
-		// custom
-		if wantCustom {
-			custom[cmn.ETag], _ = h.EncodeCksum(attrs.Etag)
-			custom[cmn.LastModified] = fmtTime(attrs.Updated)
-			custom[cos.HdrContentType] = attrs.ContentType
-			entry.Custom = cmn.CustomMD2S(custom)
-		}
+		lst.Entries = append(lst.Entries, &en)
 	}
-	lst.Entries = lst.Entries[:i]
 
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 		nlog.Infof("[list_objects] count %d", len(lst.Entries))
@@ -290,7 +284,7 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *c
 	oa.Size = attrs.Size
 	if v, ok := h.EncodeVersion(attrs.Generation); ok {
 		oa.SetCustomKey(cmn.VersionObjMD, v)
-		oa.Ver = v
+		oa.SetVersion(v)
 	}
 	if v, ok := h.EncodeCksum(attrs.MD5); ok {
 		oa.SetCustomKey(cmn.MD5ObjMD, v)
@@ -298,7 +292,7 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *c
 	if v, ok := h.EncodeCksum(attrs.CRC32C); ok {
 		oa.SetCustomKey(cmn.CRC32CObjMD, v)
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		oa.SetCustomKey(cmn.ETag, v)
 	}
 
@@ -392,7 +386,7 @@ func setCustomGs(lom *core.LOM, attrs *storage.ObjectAttrs) (expCksum *cos.Cksum
 			expCksum = cos.NewCksum(cos.ChecksumCRC32C, v)
 		}
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		lom.SetCustomKey(cmn.ETag, v)
 	}
 	lom.SetCustomKey(cmn.LastModified, fmtTime(attrs.Updated))
@@ -466,7 +460,7 @@ func readCredFile() (projectID string) {
 	if err != nil {
 		return
 	}
-	b, err := io.ReadAll(credFile)
+	b, err := cos.ReadAll(credFile)
 	credFile.Close()
 	if err != nil {
 		return

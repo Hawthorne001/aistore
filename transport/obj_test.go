@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
@@ -61,11 +61,13 @@ type dummyStatsTracker struct{}
 // interface guard
 var _ cos.StatsUpdater = (*dummyStatsTracker)(nil)
 
-func (*dummyStatsTracker) Add(string, int64)                                   {}
-func (*dummyStatsTracker) Inc(string)                                          {}
-func (*dummyStatsTracker) Get(string) int64                                    { return 0 }
-func (*dummyStatsTracker) AddMany(...cos.NamedVal64)                           {}
-func (*dummyStatsTracker) Flag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
+func (*dummyStatsTracker) Add(string, int64)                                         {}
+func (*dummyStatsTracker) Inc(string)                                                {}
+func (*dummyStatsTracker) Get(string) int64                                          { return 0 }
+func (*dummyStatsTracker) AddWith(...cos.NamedVal64)                                 {}
+func (*dummyStatsTracker) ClrFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetClrFlag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
 
 var (
 	objmux   *mux.ServeMux
@@ -89,10 +91,10 @@ func TestMain(t *testing.M) {
 	config.Transport.QuiesceTime = cos.Duration(10 * time.Second)
 	config.Log.Level = "3"
 	cmn.GCO.CommitUpdate(config)
-	sc := transport.Init(&dummyStatsTracker{}, config)
+	sc := transport.Init(&dummyStatsTracker{})
 	go sc.Run()
 
-	objmux = mux.NewServeMux()
+	objmux = mux.NewServeMux(false /*enableTracing*/)
 	path := transport.ObjURLPath("")
 	objmux.HandleFunc(path, transport.RxAnyStream)
 	objmux.HandleFunc(path+"/", transport.RxAnyStream)
@@ -102,7 +104,7 @@ func TestMain(t *testing.M) {
 
 func Example_headers() {
 	f := func(_ http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body, err := cos.ReadAll(r.Body)
 		if err != nil {
 			panic(err)
 		}
@@ -122,7 +124,8 @@ func Example_headers() {
 				break
 			}
 
-			fmt.Printf("%+v (%d)\n", hdr, hlen)
+			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n",
+				hdr.Bck.String(), hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
 			off += hlen + int(hdr.ObjAttrs.Size)
 		}
 	}
@@ -137,8 +140,8 @@ func Example_headers() {
 	stream.Fin()
 
 	// Output:
-	// {Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{Cksum:xxhash[h1] CustomMD:map[] Ver:1 Atime:663346294 Size:231} Opcode:0} (69)
-	// {Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{Cksum:xxhash[h2] CustomMD:map[xx:11 yy:22] Ver:222222222222222222222222 Atime:663346294 Size:213} Opcode:0} (110)
+	// Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{231B, v"1", xxhash[h1], map[]} (69)
+	// Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{213B, v"222222222222222222222222", xxhash[h2], map[xx:11 yy:22]} (110)
 }
 
 func sendText(stream *transport.Stream, txt1, txt2 string) {
@@ -159,10 +162,10 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Size:  sgl1.Size(),
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h1"),
-			Ver:   "1",
 		},
 		Opaque: nil,
 	}
+	hdr.ObjAttrs.SetVersion("1")
 	wg.Add(1)
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl1, Callback: cb})
 	wg.Wait()
@@ -180,10 +183,10 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Size:  sgl2.Size(),
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h2"),
-			Ver:   "222222222222222222222222",
 		},
 		Opaque: []byte{'1', '2', '3'},
 	}
+	hdr.ObjAttrs.SetVersion("222222222222222222222222")
 	hdr.ObjAttrs.SetCustomMD(cos.StrKVs{"xx": "11", "yy": "22"})
 	wg.Add(1)
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl2, Callback: cb})
@@ -193,7 +196,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 func Example_obj() {
 	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
-		object, err := io.ReadAll(objReader)
+		object, err := cos.ReadAll(objReader)
 		if err != nil {
 			panic(err)
 		}
@@ -345,7 +348,7 @@ func TestSendCallback(t *testing.T) {
 		posted    = make([]*randReader, objectCnt)
 	)
 	random := newRand(mono.NanoTime())
-	for idx := range len(posted) {
+	for idx := range posted {
 		hdr, rr := makeRandReader(random, false)
 		mu.Lock()
 		posted[idx] = rr
@@ -366,25 +369,27 @@ func TestSendCallback(t *testing.T) {
 	}
 }
 
+func _ptrstr(s string) *string { return &s }
+
 func TestObjAttrs(t *testing.T) {
 	testAttrs := []cmn.ObjAttrs{
 		{
 			Size:  1024,
 			Atime: 1024,
 			Cksum: cos.NewCksum("", ""),
-			Ver:   "102.44",
+			Ver:   _ptrstr("102.44"),
 		},
 		{
 			Size:  1024,
 			Atime: math.MaxInt64,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "120421"),
-			Ver:   "102.44",
+			Ver:   _ptrstr("102.44"),
 		},
 		{
 			Size:  0,
 			Atime: 0,
 			Cksum: cos.NewCksum(cos.ChecksumNone, "120421"),
-			Ver:   "",
+			Ver:   nil, // NOTE: "" becomes nil via ObjAttrs.SetVersion()
 		},
 	}
 
@@ -554,14 +559,14 @@ func TestDryRun(t *testing.T) {
 			size += hdr.ObjAttrs.Size
 			if size-prevsize >= cos.GiB*100 {
 				prevsize = size
-				tlog.Logf("[dry]: %d GiB\n", size/cos.GiB)
+				fmt.Printf("[dry]: %d GiB\n", size/cos.GiB)
 			}
 		}
 	}
 	stream.Fin()
 	stats := stream.GetStats()
 
-	fmt.Printf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
+	tlog.Logf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
 }
 
 func TestCompletionCount(t *testing.T) {
@@ -765,7 +770,7 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 	switch y {
 	case 0:
 		hdr.ObjAttrs.Size = (x & 0xffffff) + 1
-		hdr.ObjAttrs.Ver = s
+		hdr.ObjAttrs.SetVersion(s)
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	case 1:
 		if usePDU {
@@ -784,7 +789,7 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 		}
 	default:
 		hdr.ObjAttrs.Size = 0
-		hdr.ObjAttrs.Ver = s
+		hdr.ObjAttrs.SetVersion(s)
 		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	}

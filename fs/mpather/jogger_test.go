@@ -49,7 +49,7 @@ func TestJoggerGroup(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -109,7 +109,7 @@ func TestJoggerGroupParallel(t *testing.T) {
 	for _, baseJgOpts.Parallel = range parallelOptions {
 		t.Run(fmt.Sprintf("TestJoggerGroupParallel/%d", baseJgOpts.Parallel), func(t *testing.T) {
 			counter = atomic.NewInt32(0)
-			jg := mpather.NewJoggerGroup(baseJgOpts, cmn.GCO.Get(), "")
+			jg := mpather.NewJoggerGroup(baseJgOpts, cmn.GCO.Get(), nil)
 			jg.Run()
 			<-jg.ListenFinished()
 
@@ -143,14 +143,14 @@ func TestJoggerGroupLoad(t *testing.T) {
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
 		VisitObj: func(lom *core.LOM, buf []byte) error {
-			tassert.Errorf(t, lom.SizeBytes() == desc.ObjectSize, "incorrect object size (lom probably not loaded)")
+			tassert.Errorf(t, lom.Lsize() == desc.ObjectSize, "incorrect object size (lom probably not loaded)")
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counter.Inc()
 			return nil
 		},
 		DoLoad: mpather.Load,
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 
 	jg.Run()
 	<-jg.ListenFinished()
@@ -186,7 +186,7 @@ func TestJoggerGroupError(t *testing.T) {
 			return errors.New("oops")
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -239,7 +239,7 @@ func TestJoggerGroupOneErrorStopsAll(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -294,7 +294,7 @@ func TestJoggerGroupMultiContentTypes(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 

@@ -33,7 +33,8 @@ type (
 		BckTo   *meta.Bck
 	}
 	ECEncodeArgs struct {
-		Phase string
+		Phase   string
+		Recover bool
 	}
 	BckRenameArgs struct {
 		BckFrom *meta.Bck
@@ -69,8 +70,9 @@ func RenewBucketXact(kind string, bck *meta.Bck, args Args, buckets ...*meta.Bck
 	return dreg.renew(e, bck, buckets...)
 }
 
-func RenewECEncode(bck *meta.Bck, uuid, phase string) RenewRes {
-	return RenewBucketXact(apc.ActECEncode, bck, Args{Custom: &ECEncodeArgs{Phase: phase}, UUID: uuid})
+func RenewECEncode(bck *meta.Bck, uuid, phase string, checkAndRecover bool) RenewRes {
+	args := Args{Custom: &ECEncodeArgs{Phase: phase, Recover: checkAndRecover}, UUID: uuid}
+	return RenewBucketXact(apc.ActECEncode, bck, args)
 }
 
 func RenewMakeNCopies(uuid, tag string) {

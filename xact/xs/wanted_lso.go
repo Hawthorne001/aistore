@@ -6,8 +6,6 @@
 package xs
 
 import (
-	"fmt"
-
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -38,10 +36,6 @@ func wanted(msg *apc.LsoMsg) (flags cos.BitFlags) {
 }
 
 func (wi *walkInfo) setWanted(e *cmn.LsoEnt, lom *core.LOM) {
-	var (
-		custom  = e.Custom
-		version = e.Version
-	)
 	for name, fl := range allmap {
 		if !wi.wanted.IsSet(fl) {
 			continue
@@ -52,10 +46,10 @@ func (wi *walkInfo) setWanted(e *cmn.LsoEnt, lom *core.LOM) {
 		case apc.GetPropsCached: // via obj.SetPresent()
 
 		case apc.GetPropsSize:
-			if e.Size > 0 && lom.SizeBytes() != e.Size {
+			if e.Size > 0 && lom.Lsize() != e.Size {
 				e.SetVerChanged()
 			}
-			e.Size = lom.SizeBytes()
+			e.Size = lom.Lsize()
 		case apc.GetPropsVersion:
 			e.Version = lom.Version()
 		case apc.GetPropsChecksum:
@@ -69,24 +63,26 @@ func (wi *walkInfo) setWanted(e *cmn.LsoEnt, lom *core.LOM) {
 
 		case apc.GetPropsEC:
 			// TODO?: risk of significant slow-down loading EC metafiles
+
 		case apc.GetPropsCustom:
 			if md := lom.GetCustomMD(); len(md) > 0 {
-				e.Custom = fmt.Sprintf("%+v", md)
+				e.Custom = cmn.CustomMD2S(md)
 			}
 		default:
 			debug.Assert(false, name)
 		}
 	}
 	if wi.msg.IsFlagSet(apc.LsVerChanged) && !e.IsVerChanged() {
-		// slow path: extensive version-changed check
-		md := cmn.S2CustomMD(custom, version)
-		if len(md) > 0 {
-			var oa cmn.ObjAttrs
-			oa.CustomMD = md
-			oa.Size = e.Size
-			if !lom.Equal(&oa) {
+		//
+		// slow path: extensive 'version-changed' check
+		//
+		cmn.S2CustomMD(wi.custom, e.Custom, e.Version)
+		if len(wi.custom) > 0 {
+			oa := cmn.ObjAttrs{Size: e.Size, CustomMD: wi.custom}
+			if lom.CheckEq(&oa) != nil {
 				e.SetVerChanged()
 			}
+			clear(wi.custom)
 		}
 	}
 }

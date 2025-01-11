@@ -1,6 +1,6 @@
 // Package meta: cluster-level metadata
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package meta
 
@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -48,14 +50,14 @@ func (b *Bck) Bucket() *cmn.Bck { return (*cmn.Bck)(b) }
 
 func (b *Bck) IsAIS() bool                  { return (*cmn.Bck)(b).IsAIS() }
 func (b *Bck) HasProvider() bool            { return (*cmn.Bck)(b).HasProvider() }
-func (b *Bck) IsHTTP() bool                 { return (*cmn.Bck)(b).IsHTTP() }
+func (b *Bck) IsHT() bool                   { return (*cmn.Bck)(b).IsHT() }
 func (b *Bck) IsCloud() bool                { return (*cmn.Bck)(b).IsCloud() }
 func (b *Bck) IsRemote() bool               { return (*cmn.Bck)(b).IsRemote() }
 func (b *Bck) IsRemoteAIS() bool            { return (*cmn.Bck)(b).IsRemoteAIS() }
 func (b *Bck) IsQuery() bool                { return (*cmn.Bck)(b).IsQuery() }
 func (b *Bck) RemoteBck() *cmn.Bck          { return (*cmn.Bck)(b).RemoteBck() }
 func (b *Bck) Validate() error              { return (*cmn.Bck)(b).Validate() }
-func (b *Bck) MakeUname(name string) string { return (*cmn.Bck)(b).MakeUname(name) }
+func (b *Bck) MakeUname(name string) []byte { return (*cmn.Bck)(b).MakeUname(name) }
 func (b *Bck) Cname(name string) string     { return (*cmn.Bck)(b).Cname(name) }
 func (b *Bck) IsEmpty() bool                { return (*cmn.Bck)(b).IsEmpty() }
 func (b *Bck) HasVersioningMD() bool        { return (*cmn.Bck)(b).HasVersioningMD() }
@@ -78,40 +80,24 @@ func (b *Bck) AddUnameToQuery(q url.Values, uparam string) url.Values {
 	return bck.AddUnameToQuery(q, uparam)
 }
 
-const aisBIDmask = uint64(1 << 63)
-
-func (b *Bck) MaskBID(i int64) uint64 {
-	bck := (*cmn.Bck)(b)
-	if bck.IsAIS() {
-		return uint64(i) | aisBIDmask
-	}
-	return uint64(i)
-}
-
-func (b *Bck) unmaskBID() uint64 {
-	if b.Props == nil || b.Props.BID == 0 {
-		return 0
-	}
-	bck := (*cmn.Bck)(b)
-	if bck.IsAIS() {
-		return b.Props.BID ^ aisBIDmask
-	}
-	return b.Props.BID
-}
-
 func (b *Bck) String() string {
-	var (
-		s   string
-		bid = b.unmaskBID()
+	if b.Props == nil {
+		return b.Bucket().String()
+	}
+
+	// [NOTE]
+	// add BID
+	// for the mask to clear "ais" bit and/or other high bits reserved for LOM flags, see core/lombid
+	const (
+		aisBID = uint64(1 << 63)
 	)
-	bck := (*cmn.Bck)(b)
-	if bid == 0 {
-		return bck.String()
-	}
-	if backend := bck.Backend(); backend != nil {
-		s = ", backend=" + backend.String()
-	}
-	return fmt.Sprintf("%s(%#x%s)", bck, bid, s)
+	var sb strings.Builder
+	sb.Grow(64)
+	b.Bucket().Str(&sb)
+	sb.WriteString("(0x")
+	sb.WriteString(strconv.FormatUint((b.Props.BID &^ aisBID), 16))
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
@@ -133,6 +119,8 @@ func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
 	}
 	return true
 }
+
+func (b *Bck) Eq(other *cmn.Bck) bool { return other.Equal(b.Bucket()) }
 
 // when the bucket is not present in the BMD:
 // - always returns the corresponding *DoesNotExist error
@@ -205,10 +193,11 @@ func (b *Bck) init(bmd *BMD) error {
 func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, ecode int) {
 	bmd := bowner.Get()
 	all := bmd.getAllByName(bckName)
-	if all == nil {
+	switch {
+	case all == nil:
 		err = cmn.NewErrBckNotFound(&cmn.Bck{Name: bckName})
 		ecode = http.StatusNotFound
-	} else if len(all) == 1 {
+	case len(all) == 1:
 		bck = &all[0]
 		if bck.Props == nil {
 			err = cmn.NewErrBckNotFound(bck.Bucket())
@@ -217,12 +206,11 @@ func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, ecode i
 			debug.Assert(apc.IsRemoteProvider(backend.Provider))
 			err = backend.init(bmd)
 		}
-	} else {
-		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)",
-			bckName, all)
+	default:
+		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)", bckName, all)
 		ecode = http.StatusUnprocessableEntity
 	}
-	return
+	return bck, err, ecode
 }
 
 func (b *Bck) CksumConf() (conf *cmn.CksumConf) { return &b.Props.Cksum }
@@ -269,6 +257,9 @@ func (b *Bck) MaxPageSize() int64 {
 	case apc.Azure:
 		// ref: https://docs.microsoft.com/en-us/connectors/azureblob/#general-limits
 		return apc.MaxPageSizeAzure
+	case apc.OCI:
+		// ref: https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/Object/ListObjects
+		return apc.MaxPageSizeOCI
 	default:
 		return 1000
 	}

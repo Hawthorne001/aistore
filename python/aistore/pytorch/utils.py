@@ -4,42 +4,38 @@ Utils for AIS PyTorch Plugin
 Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 """
 
-from typing import List, Iterable
 from urllib.parse import urlunparse
-from aistore.sdk import Client
-from aistore.sdk.ais_source import AISSource
-from aistore.sdk.list_object_flag import ListObjectFlag
-from aistore.sdk.object import Object
-from aistore.sdk.bucket import Bucket
-from aistore.sdk.types import ArchiveSettings
-from aistore.sdk.utils import parse_url
+from typing import Tuple
+from aistore.sdk.utils import parse_url as sdk_parse_url
+from math import floor
+
+MB_TO_B = 1000000
 
 
-def list_objects(
-    client: Client, urls_list: List[str], ais_source_list: List[AISSource]
-) -> List[Object]:
+def convert_mb_to_bytes(megabytes: float) -> int:
     """
-    Create a list of all the objects in the given URLs and AIS sources.
+    Converts megabytes to bytes and truncates any extra bytes (floor).
 
     Args:
-        client (Client): AIStore client object
-        urls_list (List[str]): List of URLs
-        ais_source_list (List[AISSource]): List of AISSource objects to load data
+        megabytes (float): number of megabytes to convert
 
     Returns:
-        List[Object]: List of all the objects in the given URLs and AIS sources
+        int: number of bytes after conversion (floor of actual byte value)
     """
-    samples = []
+    return floor(megabytes * MB_TO_B)
 
-    for url in urls_list:
-        provider, bck_name, path = parse_url(url)
-        bucket = client.bucket(bck_name=bck_name, provider=provider)
-        samples.extend([obj for obj in bucket.list_all_objects_iter(prefix=path)])
 
-    for source in ais_source_list:
-        samples.extend([obj.name for obj in source.list_all_objects_iter()])
+def convert_bytes_to_mb(bytes: int) -> float:
+    """
+    Converts byes to megabytes.
 
-    return samples
+    Args:
+        bytes (int): number of bytes to convert to megabytes
+
+    Returns:
+        float: number of megabytes after conversion
+    """
+    return bytes / MB_TO_B
 
 
 def unparse_url(provider: str, bck_name: str, obj_name: str) -> str:
@@ -57,57 +53,43 @@ def unparse_url(provider: str, bck_name: str, obj_name: str) -> str:
     return urlunparse([provider, bck_name, obj_name, "", "", ""])
 
 
-def list_objects_iterator(
-    client: Client, urls_list: List[str] = [], ais_source_list: List[AISSource] = []
-) -> Iterable[Object]:
+def get_basename(name: str) -> str:
     """
-    Create an iterable over all the objects in the given URLs and AIS sources.
+    Get the basename of the object name by stripping any directory information and suffix.
 
     Args:
-        client (Client): AIStore client object
-        urls_list (List[str]): List of URLs
-        ais_source_list (List[AISSource]): List of AISSource objects to load data
+        name (str): Complete object name
 
     Returns:
-        Iterable[Object]: Iterable over all the objects in the given URLs and AIS sources
+        str: Basename of the object
     """
-    for url in urls_list:
-        provider, bck_name, path = parse_url(url)
-        bucket = client.bucket(bck_name=bck_name, provider=provider)
-        yield from bucket.list_all_objects_iter(prefix=path)
 
-    for source in ais_source_list:
-        yield from source.list_all_objects_iter()
+    return name.split("/")[-1].split(".")[0]
 
 
-def list_shard_objects_iterator(
-    bucket: Bucket, prefix: str = "", etl_name: str = ""
-) -> Iterable[Object]:
+def get_extension(name: str) -> str:
     """
-    Create an iterable over all the objects in the given shards.
+    Get the file extension of the object by stripping any basename or prefix.
 
     Args:
-        bucket (Bucket): Bucket containing the shards
-        prefix (str): Prefix of the object names
-        etl_name (str): ETL name to apply on each object
+        name (str): Complete object name
 
     Returns:
-        Iterable[Object]: Iterable over all the objects in the given shards,
-                          with each iteration returning a combined sample
+        str: File extension of the object
     """
-    shards_iter = bucket.list_objects_iter(prefix=prefix, props="name")
 
-    for shard in shards_iter:
-        path = shard.name
-        objects_iter = bucket.list_objects_iter(
-            prefix=path, props="name", flags=[ListObjectFlag.ARCH_DIR]
-        )
+    return name.split(".")[1]
 
-        for obj in objects_iter:
-            if obj.name == path:
-                continue
-            obj_name = obj.name.replace(f"{path}/", "", 1)
-            yield bucket.object(path).get(
-                etl_name=etl_name,
-                archive_settings=ArchiveSettings(archpath=obj_name),
-            ).read_all()
+
+def parse_url(url: str) -> Tuple[str, str, str]:
+    """
+    Wrapper of sdk/utils.py parse_url. Parse AIS URLs for bucket and object names.
+    TODO: This can be removed once the upstream torch package for aiso is updated.
+
+    Args:
+        url (str): Complete URL of the object (e.g., "ais://bucket1/file.txt")
+
+    Returns:
+        Tuple[str, str, str]: Provider, bucket name, and object name
+    """
+    return sdk_parse_url(url)

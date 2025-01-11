@@ -97,15 +97,15 @@ func (*lsoFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	return p
 }
 
-func (p *lsoFactory) Start() (err error) {
+func (p *lsoFactory) Start() error {
+	if err := cmn.ValidatePrefix("bad list-objects request", p.msg.Prefix); err != nil {
+		return err
+	}
 	r := &LsoXact{
 		streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()},
 		msg:        p.msg,
 		msgCh:      make(chan *apc.LsoMsg), // unbuffered
 		respCh:     make(chan *LsoRsp),     // ditto: one caller-requested page at a time
-	}
-	if err = cmn.ValidatePrefix(p.msg.Prefix); err != nil {
-		return err
 	}
 
 	r.lastPage = allocLsoEntries()
@@ -113,7 +113,7 @@ func (p *lsoFactory) Start() (err error) {
 
 	// idle timeout vs delayed next-page request
 	// see also: resetIdle()
-	r.DemandBase.Init(p.UUID(), apc.ActList, p.Bck, r.config.Timeout.MaxHostBusy.D())
+	r.DemandBase.Init(p.UUID(), apc.ActList, p.msg.Str(p.Bck.Cname(p.msg.Prefix)) /*ctlmsg*/, p.Bck, r.config.Timeout.MaxHostBusy.D())
 
 	// NOTE: is set by the first message, never changes
 	r.walk.wor = r.msg.WantOnlyRemoteProps()
@@ -129,7 +129,7 @@ func (p *lsoFactory) Start() (err error) {
 			nt := core.T.Sowner().Get().CountActiveTs()
 			if nt > 1 {
 				// NOTE streams
-				if err = p.beginStreams(r); err != nil {
+				if err := p.beginStreams(r); err != nil {
 					return err
 				}
 			}
@@ -147,18 +147,15 @@ func (p *lsoFactory) Start() (err error) {
 	return nil
 }
 
-func (p *lsoFactory) beginStreams(r *LsoXact) (err error) {
+func (p *lsoFactory) beginStreams(r *LsoXact) error {
 	if !r.walk.this {
 		r.remtCh = make(chan *LsoRsp, remtPageChSize) // <= by selected target (selected to page remote bucket)
 	}
 	trname := "lso-" + p.UUID()
 	dmxtra := bundle.Extra{Multiplier: 1, Config: r.config}
-	p.dm, err = bundle.NewDataMover(trname, r.recv, cmn.OwtPut, dmxtra)
-	if err != nil {
-		return err
-	}
-	debug.Assert(p.dm != nil)
-	if err = p.dm.RegRecv(); err != nil {
+	p.dm = bundle.NewDM(trname, r.recv, cmn.OwtPut, dmxtra)
+
+	if err := p.dm.RegRecv(); err != nil {
 		if p.msg.ContinuationToken != "" {
 			err = fmt.Errorf("%s: late continuation [%s,%s], DM: %v", core.T,
 				p.msg.UUID, p.msg.ContinuationToken, err)
@@ -284,9 +281,9 @@ func (r *LsoXact) resetIdle() {
 	r.DemandBase.Reset(max(r.config.Timeout.MaxKeepalive.D(), 2*time.Second))
 }
 
-func (r *LsoXact) fcleanup() (d time.Duration) {
+func (r *LsoXact) fcleanup(int64) (d time.Duration) {
 	if cnt := r.wiCnt.Load(); cnt > 0 {
-		d = time.Second
+		d = max(cmn.Rom.MaxKeepalive(), 2*time.Second)
 	} else {
 		d = hk.UnregInterval
 		if r.remtCh != nil {
@@ -295,7 +292,7 @@ func (r *LsoXact) fcleanup() (d time.Duration) {
 		close(r.msgCh)
 		r.p.dm.UnregRecv()
 	}
-	return
+	return d
 }
 
 // skip on-demand idleness check
@@ -392,7 +389,7 @@ func (r *LsoXact) nextPageR() (err error) {
 		tsi  = smap.GetActiveNode(r.msg.SID)
 	)
 	if tsi == nil {
-		err = fmt.Errorf("%s: \"paging\" %s is down or inactive, %s", r, meta.Tname(r.msg.SID), smap)
+		err = fmt.Errorf("%s: designated (\"paging\") %s is down or inactive, %s", r, meta.Tname(r.msg.SID), smap)
 		goto ex
 	}
 	r.wiCnt.Inc()
@@ -413,11 +410,12 @@ func (r *LsoXact) nextPageR() (err error) {
 		debug.Assert(!r.msg.WantOnlyRemoteProps() && /*same*/ !r.walk.wor)
 		select {
 		case rsp := <-r.remtCh:
-			if rsp == nil {
+			switch {
+			case rsp == nil:
 				err = ErrGone
-			} else if rsp.Err != nil {
+			case rsp.Err != nil:
 				err = rsp.Err
-			} else {
+			default:
 				page = rsp.Lst
 				err = npg.populate(page)
 			}

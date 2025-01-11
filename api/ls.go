@@ -5,8 +5,6 @@
 package api
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,9 +25,9 @@ const (
 
 type (
 	LsoCounter struct {
+		callback  LsoCB
 		startTime int64 // time operation started
 		callAfter int64 // callback after
-		callback  LsoCB
 		count     int
 		done      bool
 	}
@@ -38,8 +36,8 @@ type (
 	// additional and optional list-objects args (compare with: GetArgs, PutArgs)
 	ListArgs struct {
 		Callback  LsoCB
-		CallAfter time.Duration
 		Header    http.Header // to optimize listing very large buckets, e.g.: Header.Set(apc.HdrInventory, "true")
+		CallAfter time.Duration
 		Limit     int64
 	}
 )
@@ -204,7 +202,7 @@ func lsoPage(reqParams *ReqParams) (_ *cmn.LsoRes, err error) {
 		if _, err = reqParams.DoReqAny(page); err == nil {
 			return page, nil
 		}
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if !cos.IsClientTimeout(err) {
 			break
 		}
 		client := *reqParams.BaseParams.Client

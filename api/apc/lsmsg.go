@@ -75,6 +75,9 @@ const (
 	// and if it does:
 	// - check whether remote version differs from its in-cluster copy
 	LsVerChanged
+
+	// Do not return virtual subdirectories - do not include them as `cmn.LsoEnt` entries
+	LsNoDirs
 )
 
 // max page sizes
@@ -84,6 +87,7 @@ const (
 	MaxPageSizeAWS   = 1000
 	MaxPageSizeGCP   = 1000
 	MaxPageSizeAzure = 5000
+	MaxPageSizeOCI   = 1000
 )
 
 const (
@@ -138,6 +142,7 @@ var (
 )
 
 type LsoMsg struct {
+	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 	UUID              string      `json:"uuid"`                  // ID to identify a single multi-page request
 	Props             string      `json:"props"`                 // comma-delimited, e.g. "checksum,size,custom" (see GetProps* enum)
 	TimeFormat        string      `json:"time_format,omitempty"` // RFC822 is the default
@@ -147,7 +152,6 @@ type LsoMsg struct {
 	SID               string      `json:"target"`                // selected target to solely execute backend.list-objects
 	Flags             uint64      `json:"flags,string"`          // enum {LsObjCached, ...} - "LsoMsg flags" above
 	PageSize          int64       `json:"pagesize"`              // max entries returned by list objects call
-	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 }
 
 ////////////
@@ -200,6 +204,45 @@ func (lsmsg *LsoMsg) PropsSet() (s cos.StrSet) {
 		s.Set(p)
 	}
 	return s
+}
+
+func (lsmsg *LsoMsg) Str(cname string) string {
+	var sb strings.Builder
+	sb.Grow(80)
+
+	sb.WriteString(cname)
+	if lsmsg.Props != "" {
+		sb.WriteString(", props:")
+		sb.WriteString(lsmsg.Props)
+	}
+	if lsmsg.Flags == 0 {
+		return sb.String()
+	}
+
+	sb.WriteString(", flags:")
+	if lsmsg.IsFlagSet(LsObjCached) {
+		sb.WriteString("cached,")
+	}
+	if lsmsg.IsFlagSet(LsMissing) {
+		sb.WriteString("missing,")
+	}
+	if lsmsg.IsFlagSet(LsArchDir) {
+		sb.WriteString("arch,")
+	}
+	if lsmsg.IsFlagSet(LsBckPresent) {
+		sb.WriteString("bck-present,")
+	}
+	if lsmsg.IsFlagSet(LsDontAddRemote) {
+		sb.WriteString("skip-lookup,")
+	}
+	if lsmsg.IsFlagSet(LsNoRecursion) {
+		sb.WriteString("no-recurs,")
+	}
+	if lsmsg.IsFlagSet(LsVerChanged) {
+		sb.WriteString("version-changed,")
+	}
+	s := sb.String()
+	return s[:len(s)-1]
 }
 
 // LsoMsg flags enum: LsObjCached, ...

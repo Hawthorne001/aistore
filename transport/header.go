@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -109,7 +109,7 @@ func insAttrs(off int, to []byte, attr *cmn.ObjAttrs) int {
 		off = insString(off, to, cksum.Ty())
 		off = insString(off, to, cksum.Val())
 	}
-	off = insString(off, to, attr.Ver)
+	off = insString(off, to, attr.Version())
 	custom := attr.GetCustomMD()
 	for k, v := range custom {
 		debug.Assert(k != "")
@@ -196,7 +196,8 @@ func extAttrs(off int, from []byte) (n int, attr cmn.ObjAttrs) {
 	off, cksumTyp = extString(off, from)
 	off, cksumVal = extString(off, from)
 	attr.SetCksum(cksumTyp, cksumVal)
-	off, attr.Ver = extString(off, from)
+	off, v = extString(off, from)
+	attr.SetVersion(v)
 	for {
 		off, k = extString(off, from)
 		if k == "" {

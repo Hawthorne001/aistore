@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -59,6 +59,18 @@ func (*putFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	return p
 }
 
+func (p *putFactory) _tag(bck *meta.Bck) []byte {
+	var (
+		uname = bck.MakeUname("")
+		l     = cos.PackedStrLen(p.Kind()) + 1 + cos.PackedBytesLen(uname)
+		pack  = cos.NewPacker(nil, l)
+	)
+	pack.WriteString(p.Kind())
+	pack.WriteByte('|')
+	pack.WriteBytes(uname)
+	return pack.Bytes()
+}
+
 func (p *putFactory) Start() error {
 	lom := p.lom
 	slab, err := core.T.PageMM().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
@@ -66,7 +78,7 @@ func (p *putFactory) Start() error {
 
 	bck, mirror := lom.Bck(), lom.MirrorConf()
 	if !mirror.Enabled {
-		return fmt.Errorf("%s: mirroring disabled, nothing to do", bck)
+		return fmt.Errorf("%s: mirroring disabled, nothing to do", bck.String())
 	}
 	if err = fs.ValidateNCopies(core.T.String(), int(mirror.Copies)); err != nil {
 		nlog.Errorln(err)
@@ -78,12 +90,12 @@ func (p *putFactory) Start() error {
 	// target-local generation of a global UUID
 	//
 	div := uint64(xact.IdleDefault)
-	beid, _, _ := xreg.GenBEID(div, p.Kind()+"|"+bck.MakeUname(""))
+	beid, _, _ := xreg.GenBEID(div, p._tag(bck))
 	if beid == "" {
 		// is Ok (compare with x-archive, x-tco)
 		beid = cos.GenUUID()
 	}
-	r.DemandBase.Init(beid, p.Kind(), bck, xact.IdleDefault)
+	r.DemandBase.Init(beid, p.Kind(), "" /*ctlmsg*/, bck, xact.IdleDefault)
 
 	// joggers
 	r.workers = mpather.NewWorkerGroup(&mpather.WorkerGroupOpts{
@@ -202,7 +214,7 @@ func (r *XactPut) stop() (err error) {
 		err = fmt.Errorf("%s: dropped %d object%s", r, n, cos.Plural(n))
 	}
 	if cnt := r.chanFull.Load(); (cnt >= 10 && cnt <= 20) || (cnt > 0 && cmn.Rom.FastV(5, cos.SmoduleMirror)) {
-		nlog.Errorln("work channel full (all mp workers)", r.String(), cnt)
+		nlog.Errorln(cos.ErrWorkChanFull, "(all mp workers)", r.String(), "cnt", cnt)
 	}
 	return
 }

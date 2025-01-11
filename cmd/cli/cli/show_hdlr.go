@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains implementation of the top-level `show` command.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -28,16 +28,31 @@ import (
 	"github.com/urfave/cli"
 )
 
+const showJobUsage = "show running and/or finished jobs\n" +
+	indent1 + "\t- 'show job tco-cysbohAGL'\t- show a given (multi-object copy/transform) job identified by its unique ID;\n" +
+	indent1 + "\t- 'show job copy-listrange'\t- show all running multi-object copies;\n" +
+	indent1 + "\t- 'show job copy-objects'\t- same as above (using display name);\n" +
+	indent1 + "\t- 'show job copy-objects --all'\t- show both running and already finished (or stopped) multi-object copies;\n" +
+	indent1 + "\t- 'show job list'\t- show all running list-objects jobs;\n" +
+	indent1 + "\t- 'show job ls'\t- same as above;\n" +
+	indent1 + "\t- 'show job ls --refresh 10'\t- same as above with periodic _refreshing_ every 10 seconds;\n" +
+	indent1 + "\t- 'show job ls --refresh 10 --count 4'\t- same as above but only for the first four 10-seconds intervals;\n" +
+	indent1 + "\t- 'show job prefetch-listrange'\t- show all running prefetch jobs;\n" +
+	indent1 + "\t- 'show job prefetch'\t- same as above;\n" +
+	indent1 + "\t- 'show job prefetch --refresh 1m'\t- show all running prefetch jobs at 1 minute intervals (until Ctrl-C);\n" +
+	indent1 + "\t- 'show job --all'\t- show absolutely all jobs, running and already finished\n" +
+	indent1 + tabHelpOpt + "."
+
 type (
-	daemonTemplateXactSnaps struct {
+	nodeSnaps struct {
 		DaemonID  string
 		XactSnaps []*core.Snap
 	}
 
 	targetMpath struct {
-		DaemonID  string
-		Mpl       *apc.MountpathList
-		TargetCDF fs.TargetCDF
+		DaemonID string
+		Mpl      *apc.MountpathList
+		Tcdf     fs.Tcdf
 	}
 )
 
@@ -51,6 +66,7 @@ var (
 			noHeaderFlag,
 			verboseJobFlag,
 			unitsFlag,
+			dateTimeFlag,
 			// download and dsort only
 			progressFlag,
 			dsortLogFlag,
@@ -112,6 +128,7 @@ var (
 			showCmdRemoteAIS,
 			showCmdJob,
 			showCmdLog,
+			showTLS,
 		},
 	}
 
@@ -138,7 +155,7 @@ var (
 	}
 	showCmdCluster = cli.Command{
 		Name:         cmdCluster,
-		Usage:        "show cluster nodes and utilization",
+		Usage:        "main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)",
 		ArgsUsage:    showClusterArgument,
 		Flags:        showCmdsFlags[cmdCluster],
 		Action:       showClusterHandler,
@@ -146,7 +163,7 @@ var (
 		Subcommands: []cli.Command{
 			{
 				Name:         cmdSmap,
-				Usage:        "show Smap (cluster map)",
+				Usage:        "show cluster map (Smap)",
 				ArgsUsage:    optionalNodeIDArgument,
 				Flags:        showCmdsFlags[cmdSmap],
 				Action:       showSmapHandler,
@@ -154,7 +171,7 @@ var (
 			},
 			{
 				Name:         cmdBMD,
-				Usage:        "show BMD (bucket metadata)",
+				Usage:        "show bucket metadata (BMD)",
 				ArgsUsage:    optionalNodeIDArgument,
 				Flags:        showCmdsFlags[cmdBMD],
 				Action:       showBMDHandler,
@@ -196,7 +213,7 @@ var (
 
 	showCmdJob = cli.Command{
 		Name:         commandJob,
-		Usage:        "show running and finished jobs ('--all' for all, or " + tabHelpOpt + ")",
+		Usage:        showJobUsage,
 		ArgsUsage:    jobAnyArg,
 		Flags:        showCmdsFlags[commandJob],
 		Action:       showJobsHandler,
@@ -221,9 +238,15 @@ func showJobsHandler(c *cli.Context) error {
 	var l int
 	l, err = showJobsDo(c, name, xid, daemonID, bck)
 	if err == nil && l == 0 && !flagIsSet(c, allJobsFlag) {
-		n, h := qflprn(allJobsFlag), qflprn(cli.HelpFlag)
-		fmt.Fprintf(c.App.Writer, "No running jobs. "+
-			"Use %s to show all, %s <TAB-TAB> to select, %s for details.\n", n, n, h)
+		var (
+			what string
+			n, h = qflprn(allJobsFlag), qflprn(cli.HelpFlag)
+		)
+		if name != "" {
+			what = " '" + name + "'"
+		}
+		fmt.Fprintf(c.App.Writer, "No running%s jobs. "+
+			"Use %s to show all, %s <TAB-TAB> to select, %s for details.\n", what, n, n, h)
 	}
 	return err
 }
@@ -271,31 +294,34 @@ func showJobsDo(c *cli.Context, name, xid, daemonID string, bck cmn.Bck) (int, e
 	return ll, err
 }
 
-func jobCptn(c *cli.Context, name string, onlyActive bool, xid string, byTarget bool) {
+func _jname(xname, xid string) string { return xname + "[" + xid + "]" }
+
+func jobCptn(c *cli.Context, name, xid, ctlmsg string, onlyActive, byTarget bool) {
 	var (
 		s, tip string
 	)
 	if !flagIsSet(c, verboseJobFlag) {
-		// xactions that have extended stats
-		var extended bool
-		if _, dtor, err := xact.GetDescriptor(name); err == nil {
-			extended = dtor.ExtendedStats
-		}
-		if extended {
-			tip = fmt.Sprintf(" (tip: use %s to include extended stats)", qflprn(verboseJobFlag))
+		if _, dtor, err := xact.GetDescriptor(name); err == nil && dtor.ExtendedStats {
+			tip = fmt.Sprintf("(tip: use %s to include extended stats)", qflprn(verboseJobFlag))
 		}
 	}
 	if xid != "" {
-		actionCptn(c, jobName(name, xid), tip)
+		jname := _jname(name, xid)
+		if ctlmsg != "" {
+			actionCptn(c, jname, "(run options:", fcyan(ctlmsg)+")", tip)
+		} else {
+			actionCptn(c, jname, tip)
+		}
 		return
 	}
+
 	if byTarget {
-		s = " by target"
+		s = "by target"
 	}
 	if onlyActive {
-		actionCptn(c, name, " jobs"+s+tip)
+		actionCptn(c, name, "jobs", s, tip)
 	} else {
-		actionCptn(c, name, " jobs"+s+" including finished"+tip)
+		actionCptn(c, name, "jobs", s, "including finished", tip)
 	}
 }
 
@@ -356,7 +382,7 @@ func showDsorts(c *cli.Context, id string, caption bool) (int, error) {
 			return l, V(err)
 		}
 		if caption {
-			jobCptn(c, cmdDsort, onlyActive, id, false)
+			jobCptn(c, cmdDsort, id, "" /*ctlmsg*/, onlyActive, false)
 		}
 		return l, dsortJobsList(c, list, usejs)
 	}
@@ -407,13 +433,15 @@ func showClusterHandler(c *cli.Context) error {
 		return V(err)
 	}
 
-	return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, cos.Either(sid, what))
+	return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, cos.Left(sid, what))
 }
 
 func xactList(c *cli.Context, xargs *xact.ArgsMsg, caption bool) (int, error) {
 	// override the caller's choice if explicitly identified
 	if xargs.ID != "" {
-		debug.Assert(xact.IsValidUUID(xargs.ID), xargs.ID)
+		if !xact.IsValidUUID(xargs.ID) {
+			return 0, fmt.Errorf("UUID %q is invalid (typo?)", xargs.ID)
+		}
 		xargs.OnlyRunning = false
 	}
 
@@ -465,8 +493,9 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 
 	// second, filteredXs => dts templates
 	var (
+		ctlmsg             string
 		fromToBck, haveBck bool
-		dts                = make([]daemonTemplateXactSnaps, 0, len(filteredXs))
+		dts                = make([]nodeSnaps, 0, len(filteredXs))
 	)
 	for tid, snaps := range filteredXs {
 		if len(snaps) == 0 {
@@ -481,7 +510,19 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 		} else if !snaps[0].Bck.IsEmpty() {
 			haveBck = true
 		}
-		dts = append(dts, daemonTemplateXactSnaps{DaemonID: tid, XactSnaps: snaps})
+
+		// a.k.a "run options"
+		// try to show more but not too much
+		switch {
+		case ctlmsg == "":
+			ctlmsg = snaps[0].CtlMsg
+		case ctlmsg != snaps[0].CtlMsg && len(ctlmsg)+len(snaps[0].CtlMsg) < 60:
+			ctlmsg += "; " + snaps[0].CtlMsg
+		case !strings.HasSuffix(ctlmsg, "..."):
+			ctlmsg += "; ..."
+		}
+
+		dts = append(dts, nodeSnaps{DaemonID: tid, XactSnaps: snaps})
 	}
 	sort.Slice(dts, func(i, j int) bool {
 		return dts[i].DaemonID < dts[j].DaemonID // ascending by node id/name
@@ -489,7 +530,7 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 
 	_, xname := xact.GetKindName(xargs.Kind)
 	if caption {
-		jobCptn(c, xname, xargs.OnlyRunning, xargs.ID, xargs.DaemonID != "")
+		jobCptn(c, xname, xargs.ID, ctlmsg, xargs.OnlyRunning, xargs.DaemonID != "")
 	}
 
 	l := len(dts)
@@ -499,12 +540,13 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 		usejs       = flagIsSet(c, jsonFlag)
 		hideHeader  = flagIsSet(c, noHeaderFlag)
 		units, errU = parseUnitsFlag(c, unitsFlag)
+		datedTime   = flagIsSet(c, dateTimeFlag)
 	)
 	if errU != nil {
 		actionWarn(c, errU.Error())
 		units = ""
 	}
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units), UseJSON: usejs}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, datedTime), UseJSON: usejs}
 	switch xargs.Kind {
 	case apc.ActECGet:
 		if hideHeader {
@@ -551,7 +593,7 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 			err     error
 		)
 		debug.Assert(name != "", di.XactSnaps[0].Kind)
-		actionCptn(c, meta.Tname(di.DaemonID)+": ", fmt.Sprintf("%s[%s] stats", name, di.XactSnaps[0].ID))
+		actionCptn(c, meta.Tname(di.DaemonID)+":", fmt.Sprintf("%s[%s] stats", name, di.XactSnaps[0].ID))
 
 		if hideHeader {
 			err = teb.Print(props, teb.PropValTmplNoHdr, teb.Jopts(usejs))
@@ -577,7 +619,8 @@ func showObjectHandler(c *cli.Context) error {
 	if _, err := headBucket(bck, true /* don't add */); err != nil {
 		return err
 	}
-	return showObjProps(c, bck, object)
+	_, err = showObjProps(c, bck, object, false /*silent*/)
+	return err
 }
 
 func showBckPropsHandler(c *cli.Context) error {
@@ -599,7 +642,7 @@ func showSmapHandler(c *cli.Context) error {
 	if node != nil {
 		var out any
 		sid = node.ID()
-		actionCptn(c, "Cluster map from: ", sname)
+		actionCptn(c, "Cluster map from:", sname)
 		out, err = api.GetNodeMeta(apiBP, sid, apc.WhatSmap)
 		if err == nil {
 			smap = out.(*meta.Smap)
@@ -628,7 +671,7 @@ func showBMDHandler(c *cli.Context) error {
 	if node != nil {
 		var out any
 		sid = node.ID()
-		actionCptn(c, "BMD from: ", sname)
+		actionCptn(c, "BMD from:", sname)
 		out, err = api.GetNodeMeta(apiBP, sid, apc.WhatBMD)
 		if err == nil {
 			bmd = out.(*meta.BMD)
@@ -641,7 +684,7 @@ func showBMDHandler(c *cli.Context) error {
 	}
 
 	if bmd.IsEmpty() {
-		msg := fmt.Sprintf("%s is empty - no buckets", bmd)
+		msg := bmd.StringEx() + " - is empty"
 		actionDone(c, msg)
 		return nil
 	}
@@ -674,7 +717,7 @@ func showBMDHandler(c *cli.Context) error {
 					}
 				}
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					provider, ns, bucket, props.BackendBck, copies, ec,
+					provider, ns, bucket, props.BackendBck.String(), copies, ec,
 					cos.FormatNanoTime(props.Created, ""))
 			}
 		}
@@ -703,6 +746,7 @@ func showAnyConfigHandler(c *cli.Context) error {
 	}
 }
 
+// TODO: prune config.ClusterConfig - hide deprecated "non_electable"
 func showClusterConfig(c *cli.Context, section string) error {
 	var (
 		usejs          = flagIsSet(c, jsonFlag)
@@ -722,7 +766,18 @@ func showClusterConfig(c *cli.Context, section string) error {
 	if usejs {
 		return teb.Print(cluConfig, "", teb.Jopts(usejs))
 	}
-	flat := flattenJSON(cluConfig, section)
+
+	var flat nvpairList
+	if section != "backend" {
+		flat = flattenJSON(cluConfig, section)
+	} else {
+		backends, err := api.GetConfiguredBackends(apiBP)
+		if err != nil {
+			return V(err)
+		}
+		flat = flattenBackends(backends)
+	}
+
 	if flagIsSet(c, noHeaderFlag) {
 		err = teb.Print(flat, teb.PropValTmplNoHdr)
 	} else {
@@ -778,6 +833,10 @@ func showNodeConfig(c *cli.Context) error {
 		}
 	}
 
+	if section == "backend" {
+		// NOTE compare with showClusterConfig above (ref 080235)
+		usejs = true
+	}
 	if usejs {
 		opts := teb.Jopts(true)
 		warn := "option " + qflprn(jsonFlag) + " won't show node <=> cluster configuration differences, if any."
@@ -801,12 +860,12 @@ func showNodeConfig(c *cli.Context) error {
 			return nil
 		default: // cfgScopeAll
 			if section == "" {
-				actionCptn(c, sname, " local config:")
+				actionCptn(c, sname, "local config:")
 				if err := teb.Print(&config.LocalConfig, "", opts); err != nil {
 					return err
 				}
 				fmt.Fprintln(c.App.Writer)
-				actionCptn(c, sname, " inherited config:")
+				actionCptn(c, sname, "inherited config:")
 				actionWarn(c, warn)
 				return teb.Print(&config.ClusterConfig, "", opts)
 			}
@@ -848,6 +907,7 @@ func showNodeConfig(c *cli.Context) error {
 	return err
 }
 
+// TODO -- FIXME: check backend.conf <new JSON formatted value>
 func showRemoteAISHandler(c *cli.Context) error {
 	const (
 		warnRemAisOffline = `remote ais cluster at %s is currently unreachable.
@@ -912,7 +972,7 @@ For details and usage examples, see: docs/cli/config.md`
 				continue
 			}
 			fmt.Fprintln(c.App.Writer)
-			actionCptn(c, ra.Alias+"["+ra.UUID+"]", " cluster map:")
+			actionCptn(c, ra.Alias+"["+ra.UUID+"]", "cluster map:")
 			err := smapFromNode(c, ra.Smap, "" /*daemonID*/, flagIsSet(c, jsonFlag))
 			if err != nil {
 				actionWarn(c, err.Error())
