@@ -39,6 +39,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 type (
@@ -75,11 +76,7 @@ var (
 var _ core.Backend = (*azbp)(nil)
 
 func azProto() string {
-	proto := os.Getenv(azProtoEnvVar)
-	if proto == "" {
-		proto = azDefaultProto
-	}
-	return proto
+	return cos.Right(azDefaultProto, os.Getenv(azProtoEnvVar))
 }
 
 func azAccName() string { return os.Getenv(azAccNameEnvVar) }
@@ -101,7 +98,7 @@ func asEndpoint() string {
 	}
 }
 
-func NewAzure(t core.TargetPut) (core.Backend, error) {
+func NewAzure(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
 	blurl := asEndpoint()
 
 	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
@@ -109,13 +106,16 @@ func NewAzure(t core.TargetPut) (core.Backend, error) {
 	if err != nil {
 		return nil, cmn.NewErrFailedTo(nil, azErrPrefix+": init]", "credentials", err)
 	}
-
-	return &azbp{
+	bp := &azbp{
 		t:     t,
 		creds: creds,
 		u:     blurl,
-		base:  base{apc.Azure},
-	}, nil
+		base:  base{provider: apc.Azure},
+	}
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
+
+	return bp, nil
 }
 
 // (compare w/ cmn/backend)
@@ -247,6 +247,7 @@ func (azbp *azbp) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, in
 
 // TODO: support non-recursive (apc.LsNoRecursion) operation, as in:
 // $ az storage blob list -c abc --prefix sub/ --delimiter /
+// TODO: research "hierarchical namespaces"
 // See also: aws.go, gcp.go
 func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, error) {
 	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
@@ -274,49 +275,43 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 	}
 
 	var (
-		custom     cos.StrKVs
-		l          = len(resp.Segment.BlobItems)
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
+		custom     []string
 	)
-	for i := len(lst.Entries); i < l; i++ {
-		lst.Entries = append(lst.Entries, &cmn.LsoEnt{}) // add missing empty
-	}
 	if wantCustom {
-		custom = make(cos.StrKVs, 4) // reuse
+		custom = make([]string, 0, 8)
 	}
-	for idx := range resp.Segment.BlobItems {
-		var (
-			blob  = resp.Segment.BlobItems[idx]
-			entry = lst.Entries[idx]
-		)
-		entry.Name = *blob.Name
-		entry.Size = *blob.Properties.ContentLength
+	lst.Entries = lst.Entries[:0]
+	for _, blob := range resp.Segment.BlobItems {
+		en := cmn.LsoEnt{Name: *blob.Name, Size: *blob.Properties.ContentLength}
+
+		// not expecting directories
+		debug.Assert(en.Name != "" && !cos.IsLastB(en.Name, '/'), en.Name)
+
 		if msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize) {
+			lst.Entries = append(lst.Entries, &en)
 			continue
 		}
 
-		entry.Checksum = azEncodeChecksum(blob.Properties.ContentMD5)
-
+		en.Checksum = azEncodeChecksum(blob.Properties.ContentMD5)
 		etag := azEncodeEtag(*blob.Properties.ETag)
-		entry.Version = etag // (TODO a the top)
-
-		// custom
+		en.Version = etag // (TODO a the top)
 		if wantCustom {
-			clear(custom)
-			custom[cmn.ETag] = etag
+			custom = custom[:0]
+			custom = append(custom, cmn.ETag, etag)
 			if !blob.Properties.LastModified.IsZero() {
-				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
+				custom = append(custom, cmn.LastModified, fmtTime(*blob.Properties.LastModified))
 			}
 			if blob.Properties.ContentType != nil {
-				custom[cos.HdrContentType] = *blob.Properties.ContentType
+				custom = append(custom, cos.HdrContentType, *blob.Properties.ContentType)
 			}
 			if blob.VersionID != nil {
-				custom[cmn.VersionObjMD] = *blob.VersionID
+				custom = append(custom, cmn.VersionObjMD, *blob.VersionID)
 			}
-			entry.Custom = cmn.CustomMD2S(custom)
+			en.Custom = cmn.CustomProps2S(custom...)
 		}
+		lst.Entries = append(lst.Entries, &en)
 	}
-	lst.Entries = lst.Entries[:l]
 
 	if resp.NextMarker != nil {
 		lst.ContinuationToken = *resp.NextMarker
@@ -387,7 +382,7 @@ func (azbp *azbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (
 	etag := azEncodeEtag(*resp.ETag)
 	oa.SetCustomKey(cmn.ETag, etag)
 
-	oa.Ver = etag // TODO #200224
+	oa.SetVersion(etag) // TODO #200224
 
 	if md5 := azEncodeChecksum(resp.ContentMD5); md5 != "" {
 		oa.SetCustomKey(cmn.MD5ObjMD, md5)
@@ -490,7 +485,7 @@ func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, 
 	cloudBck := lom.Bck().RemoteBck()
 
 	opts := azblob.UploadStreamOptions{}
-	if size := lom.SizeBytes(true); size > cos.MiB {
+	if size := lom.Lsize(true); size > cos.MiB {
 		opts.Concurrency = int(min((size+cos.MiB-1)/cos.MiB, 8))
 	}
 

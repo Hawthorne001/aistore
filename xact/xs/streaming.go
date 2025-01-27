@@ -6,7 +6,6 @@
 package xs
 
 import (
-	"strconv"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
@@ -73,11 +72,30 @@ func (p *streamingF) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // independently on (by) all targets and using the latter as both xaction ID and receive endpoint (trname)
 // for target=>target streams.
 
+func (p *streamingF) _tag(fromBck, toBck *meta.Bck) (tag []byte) {
+	var (
+		from = fromBck.MakeUname("")
+		to   = toBck.MakeUname("")
+		bmd  = core.T.Bowner().Get()
+		l    = cos.PackedStrLen(p.kind) + 1 + cos.PackedBytesLen(from) + 1 + cos.PackedBytesLen(to) + 1 + cos.SizeofI64
+		pack = cos.NewPacker(nil, l)
+	)
+	pack.WriteString(p.kind)
+	pack.WriteByte('|')
+	pack.WriteBytes(from)
+	pack.WriteByte('|')
+	pack.WriteBytes(to)
+	pack.WriteByte('|')
+	pack.WriteInt64(bmd.Version)
+	tag = pack.Bytes()
+	debug.Assert(len(tag) == l, len(tag), " vs ", l)
+	return tag
+}
+
 func (p *streamingF) genBEID(fromBck, toBck *meta.Bck) (string, error) {
 	var (
 		div = uint64(xact.IdleDefault)
-		bmd = core.T.Bowner().Get()
-		tag = p.kind + "|" + fromBck.MakeUname("") + "|" + toBck.MakeUname("") + "|" + strconv.FormatInt(bmd.Version, 10)
+		tag = p._tag(fromBck, toBck)
 	)
 	beid, prev, err := xreg.GenBEID(div, tag)
 	if beid != "" {
@@ -90,7 +108,7 @@ func (p *streamingF) genBEID(fromBck, toBck *meta.Bck) (string, error) {
 	return "", err
 }
 
-func (p *streamingF) newDM(trname string, recv transport.RecvObj, config *cmn.Config, owt cmn.OWT, sizePDU int32) (err error) {
+func (p *streamingF) newDM(trname string, recv transport.RecvObj, config *cmn.Config, owt cmn.OWT, sizePDU int32) error {
 	smap := core.T.Sowner().Get()
 	if err := core.InMaintOrDecomm(smap, core.T.Snode(), p.xctn); err != nil {
 		return err
@@ -101,20 +119,19 @@ func (p *streamingF) newDM(trname string, recv transport.RecvObj, config *cmn.Co
 
 	// consider adding config.X.Compression, config.X.SbundleMult (currently, always 1), etc.
 	dmxtra := bundle.Extra{Config: config, Multiplier: 1, SizePDU: sizePDU}
-	p.dm, err = bundle.NewDataMover(trname, recv, owt, dmxtra)
-	if err != nil {
-		return err
-	}
-	if err = p.dm.RegRecv(); err == nil {
+	p.dm = bundle.NewDM(trname, recv, owt, dmxtra)
+
+	err := p.dm.RegRecv()
+	if err == nil {
 		return nil
 	}
-
 	nlog.Errorln(err)
 	sleep := cos.ProbingFrequency(waitRegRecv)
 	for total := time.Duration(0); err != nil && transport.IsErrDuplicateTrname(err) && total < waitRegRecv; total += sleep {
 		time.Sleep(sleep)
 		err = p.dm.RegRecv()
 	}
+
 	return err
 }
 
@@ -172,13 +189,13 @@ func (r *streamingX) fin(unreg bool) {
 	}
 }
 
-func (r *streamingX) wurr() time.Duration {
+func (r *streamingX) wurr(int64) time.Duration {
 	if cnt := r.wiCnt.Load(); cnt > 0 {
 		r.maxWt += waitUnregRecv
 		if r.maxWt < waitUnregMax {
 			return waitUnregRecv
 		}
-		nlog.Errorf("%s: unreg timeout %v, cnt %d", r, r.maxWt, cnt)
+		nlog.Errorln(r.String(), "unreg timeout", r.maxWt, "count", cnt)
 	}
 	r.p.dm.UnregRecv()
 	return hk.UnregInterval

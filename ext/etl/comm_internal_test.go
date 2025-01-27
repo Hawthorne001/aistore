@@ -7,7 +7,6 @@ package etl
 import (
 	cryptorand "crypto/rand"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -91,7 +90,7 @@ var _ = Describe("CommunicatorTest", func() {
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		targetServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			err := comm.InlineTransform(w, r, clusterBck, objName)
+			err := comm.InlineTransform(w, r, lom)
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +133,7 @@ var _ = Describe("CommunicatorTest", func() {
 			Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()
 
-			b, err := io.ReadAll(resp.Body)
+			b, err := cos.ReadAll(resp.Body)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(b)).To(Equal(len(transformData)))
 			Expect(b).To(Equal(transformData))

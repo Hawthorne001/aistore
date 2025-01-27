@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 )
 
 // NOTE: compare with ext/etl/dp.go
@@ -96,7 +97,7 @@ remote:
 	// (compare w/ T.GetCold)
 	lom.SetAtimeUnix(time.Now().UnixNano())
 	oah := &cmn.ObjAttrs{
-		Ver:   "",            // TODO: differentiate between copying (same version) vs. transforming
+		Ver:   nil,           // TODO: differentiate between copying (same version) vs. transforming
 		Cksum: cos.NoneCksum, // will likely reassign (below)
 		Atime: lom.AtimeUnix(),
 	}
@@ -116,7 +117,7 @@ remote:
 // - [Sync] when Sync option is used (via bucket config and/or `sync` argument) caller MUST take wlock or rlock
 // - [MAY] delete remotely-deleted (non-existing) object and increment associated stats counter
 //
-// Returns NotFound also after having removed local replica (the Sync option)
+// also returns `NotFound` after removing local replica - the Sync option
 func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRMD) {
 	bck := lom.Bck()
 	if !bck.HasVersioningMD() {
@@ -125,42 +126,47 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRM
 		return CRMD{Eq: true}
 	}
 
-	oa, ecode, err := T.Backend(bck).HeadObj(context.Background(), lom, origReq)
+	oa, ecode, err := T.HeadCold(lom, origReq)
 	if err == nil {
-		debug.Assert(ecode == 0, ecode)
-		return CRMD{ObjAttrs: oa, Eq: lom.Equal(oa), ErrCode: ecode}
-	}
-
-	if ecode == http.StatusNotFound {
+		e := lom.CheckEq(oa)
+		if !lom.IsFeatureSet(feat.DisableColdGET) || e == nil {
+			debug.Assert(ecode == 0, ecode)
+			return CRMD{ObjAttrs: oa, Eq: e == nil, ErrCode: ecode}
+		}
+		// Cold Get disabled and metadata doesn't match, so we must treat
+		// it as if the object doesn't really exist.
+		err = cmn.NewErrRemoteMetadataMismatch(e)
+		ecode = http.StatusNotFound
+	} else if ecode == http.StatusNotFound {
 		err = cos.NewErrNotFound(T, lom.Cname())
 	}
+
 	if !locked {
 		// return info (neq and, possibly, not-found), and be done
-		return CRMD{ErrCode: ecode, Err: err}
+		return CRMD{ObjAttrs: oa, ErrCode: ecode, Err: err}
 	}
 
 	// rm remotely-deleted
 	if cos.IsNotExist(err, ecode) && (lom.VersionConf().Sync || sync) {
-		errDel := lom.Remove(locked /*force through rlock*/)
+		errDel := lom.RemoveObj(locked /*force through rlock*/)
 		if errDel != nil {
 			ecode, err = 0, errDel
 		} else {
-			g.tstats.Inc(RemoteDeletedDelCount)
+			vlabs := map[string]string{"bucket": lom.Bck().Cname("")} // TODO -- FIXME: cannot import stats
+			g.tstats.AddWith(cos.NamedVal64{Name: RemoteDeletedDelCount, Value: 1, VarLabs: vlabs})
 		}
 		debug.Assert(err != nil)
 		return CRMD{ErrCode: ecode, Err: err}
 	}
 
 	lom.Uncache()
-	return CRMD{ErrCode: ecode, Err: err}
+	return CRMD{ObjAttrs: oa, ErrCode: ecode, Err: err}
 }
 
-// NOTE: must be locked; NOTE: Sync == false (ie., not deleting)
+// NOTE: Sync is false (ie., not deleting)
 func (lom *LOM) LoadLatest(latest bool) (oa *cmn.ObjAttrs, deleted bool, err error) {
-	debug.AssertFunc(func() bool {
-		rc, exclusive := lom.IsLocked()
-		return exclusive || rc > 0
-	})
+	debug.Assert(lom.isLockedRW(), lom.Cname()) // caller must take a lock
+
 	err = lom.Load(true /*cache it*/, true /*locked*/)
 	if err != nil {
 		if !cmn.IsErrObjNought(err) || !latest {

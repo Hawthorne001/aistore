@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/tools/trand"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -68,11 +69,11 @@ var _ = Describe("space evict/cleanup tests", func() {
 			initConfig()
 			createAndAddMountpath(basePath)
 			core.T = newTargetLRUMock()
-			availablePaths := fs.GetAvail()
+			avail := fs.GetAvail()
 			bck := cmn.Bck{Name: bucketName, Provider: apc.AIS, Ns: cmn.NsGlobal}
 			bckAnother = cmn.Bck{Name: bucketNameAnother, Provider: apc.AIS, Ns: cmn.NsGlobal}
-			filesPath = availablePaths[basePath].MakePathCT(&bck, fs.ObjectType)
-			fpAnother = availablePaths[basePath].MakePathCT(&bckAnother, fs.ObjectType)
+			filesPath = avail[basePath].MakePathCT(&bck, fs.ObjectType)
+			fpAnother = avail[basePath].MakePathCT(&bckAnother, fs.ObjectType)
 			cos.CreateDir(filesPath)
 			cos.CreateDir(fpAnother)
 		})
@@ -261,8 +262,8 @@ var _ = Describe("space evict/cleanup tests", func() {
 			})
 			It("should remove all deleted items", func() {
 				var (
-					availablePaths = fs.GetAvail()
-					mi             = availablePaths[basePath]
+					avail = fs.GetAvail()
+					mi    = avail[basePath]
 				)
 
 				saveRandomFiles(filesPath, 10)
@@ -343,7 +344,7 @@ func newTargetLRUMock() *mock.TargetMock {
 
 func newIniLRU() *space.IniLRU {
 	xlru := &space.XactLRU{}
-	xlru.InitBase(cos.GenUUID(), apc.ActLRU, nil)
+	xlru.InitBase(cos.GenUUID(), apc.ActLRU, "" /*ctlmsg*/, nil)
 	return &space.IniLRU{
 		Xaction:             xlru,
 		Config:              cmn.GCO.Get(),
@@ -355,11 +356,12 @@ func newIniLRU() *space.IniLRU {
 
 func newInitStoreCln() *space.IniCln {
 	xcln := &space.XactCln{}
-	xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, nil)
+	xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, "" /*ctlmsg*/, nil)
 	return &space.IniCln{
 		Xaction: xcln,
 		Config:  cmn.GCO.Get(),
 		StatsT:  mock.NewStatsTracker(),
+		Args:    &xact.ArgsMsg{},
 	}
 }
 

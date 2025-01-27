@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -11,10 +11,13 @@ import (
 	"io"
 )
 
-// copy .tar, .tar.gz, and .tar.lz4 (`src` => `tw` one file at a time)
-// - opens specific arch reader
-// - always closes it
+// copy `src` => `tw` destination, one file at a time
+// handles .tar, .tar.gz, and .tar.lz4
+// - open specific arch reader
+// - always close it
 // - `tw` is the writer that can be further used to write (ie., append)
+//
+// see also: cpZip below
 func cpTar(src io.Reader, tw *tar.Writer, buf []byte) (err error) {
 	tr := tar.NewReader(src)
 	for err == nil {

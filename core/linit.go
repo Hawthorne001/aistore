@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
@@ -31,13 +32,16 @@ import (
 // 8) periodic (lazy) eviction followed by access-time synchronization: see LomCacheRunner
 
 // NOTE: to facilitate fast path filtering-out
-func (lom *LOM) PreInit(fqn string) (err error) {
-	var parsed fs.ParsedFQN
-	lom.HrwFQN, err = ResolveFQN(fqn, &parsed)
+func (lom *LOM) PreInit(fqn string) error {
+	var (
+		parsed      fs.ParsedFQN
+		hrwFQN, err = ResolveFQN(fqn, &parsed)
+	)
 	if err != nil {
-		return
+		return err
 	}
 	debug.Assert(parsed.ContentType == fs.ObjectType)
+	lom.HrwFQN = &hrwFQN
 	lom.FQN = fqn
 	lom.mi = parsed.Mountpath
 	lom.digest = parsed.Digest
@@ -50,7 +54,8 @@ func (lom *LOM) PostInit() (err error) {
 	if err = lom.bck.InitFast(T.Bowner()); err != nil {
 		return err
 	}
-	lom.md.uname = lom.bck.MakeUname(lom.ObjName)
+	uname := lom.bck.MakeUname(lom.ObjName)
+	lom.md.uname = cos.UnsafeSptr(uname)
 	return nil
 }
 
@@ -75,7 +80,7 @@ func (lom *LOM) InitCT(ct *CT) {
 	lom.digest = ct.digest
 	lom.ObjName = ct.objName
 	lom.bck = *ct.bck
-	lom.md.uname = ct.Uname()
+	lom.md.uname = ct.UnamePtr()
 }
 
 func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
@@ -83,18 +88,23 @@ func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
 	if err = lom.bck.InitFast(T.Bowner()); err != nil {
 		return
 	}
-	lom.md.uname = lom.bck.MakeUname(lom.ObjName)
-	lom.mi, lom.digest, err = fs.Hrw(lom.md.uname)
+	uname := lom.bck.MakeUname(lom.ObjName)
+	lom.md.uname = cos.UnsafeSptr(uname)
+	lom.mi, lom.digest, err = fs.Hrw(uname)
 	if err != nil {
 		return
 	}
 	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
-	lom.HrwFQN = lom.FQN
+	lom.HrwFQN = &lom.FQN
 	return
 }
 
 func (lom *LOM) String() string {
-	sb := &strings.Builder{}
+	var (
+		sb strings.Builder
+		l  = 2 + len(lom.bck.Name) + 1 + len(lom.ObjName) + 4
+	)
+	sb.Grow(l)
 	sb.WriteString("o[")
 	sb.WriteString(lom.bck.Name)
 	sb.WriteByte('/')
@@ -107,11 +117,11 @@ func (lom *LOM) String() string {
 }
 
 // allocates and copies metadata (in particular, atime and uname)
+// NOTE: cloned lom.bid() == 0 is possible - copying/transforming scenarios
 func (lom *LOM) CloneMD(fqn string) *LOM {
 	dst := AllocLOM("")
 	*dst = *lom
 	dst.md = lom.md
-	dst.md.bckID = 0
 	dst.md.copies = nil
 	dst.FQN = fqn
 	return dst

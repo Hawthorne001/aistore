@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file provides advanced commands that are useful for testing or development but not everyday use.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -18,26 +18,26 @@ import (
 var (
 	advancedCmd = cli.Command{
 		Name:  commandAdvanced,
-		Usage: "special commands intended for development and advanced usage",
+		Usage: "Special commands intended for development and advanced usage",
 		Subcommands: []cli.Command{
 			jobStartResilver,
 			{
 				Name:         cmdPreload,
-				Usage:        "preload object metadata into in-memory cache",
+				Usage:        "Preload object metadata into in-memory cache",
 				ArgsUsage:    bucketArgument,
 				Action:       loadLomCacheHandler,
 				BashComplete: bucketCompletions(bcmplop{}),
 			},
 			{
 				Name:         cmdRmSmap,
-				Usage:        "immediately remove node from cluster map (advanced usage - potential data loss!)",
+				Usage:        "Immediately remove node from cluster map (beware: potential data loss!)",
 				ArgsUsage:    nodeIDArgument,
 				Action:       removeNodeFromSmap,
 				BashComplete: suggestAllNodes,
 			},
 			{
 				Name:   cmdRandNode,
-				Usage:  "print random node ID (by default, random target)",
+				Usage:  "Print random node ID (by default, ID of a randomly selected target)",
 				Action: randNode,
 				BashComplete: func(c *cli.Context) {
 					if c.NArg() == 0 {
@@ -47,16 +47,30 @@ var (
 			},
 			{
 				Name:         cmdRandMountpath,
-				Usage:        "print a random mountpath from a given target",
+				Usage:        "Print a random mountpath from a given target",
 				Action:       randMountpath,
 				BashComplete: suggestTargets,
 			},
 			{
 				Name:         cmdRotateLogs,
-				Usage:        "rotate logs",
+				Usage:        "Rotate aistore logs",
 				ArgsUsage:    optionalNodeIDArgument,
 				Action:       rotateLogs,
 				BashComplete: suggestAllNodes,
+			},
+			{
+				Name:         cmdBackendEnable,
+				Usage:        "(Re)enable cloud backend (see also: 'ais config cluster backend')",
+				ArgsUsage:    cloudProviderArg,
+				Action:       backendEnableHandler,
+				BashComplete: suggestCloudProvider,
+			},
+			{
+				Name:         cmdBackendDisable,
+				Usage:        "Disable cloud backend (see also: 'ais config cluster backend')",
+				ArgsUsage:    cloudProviderArg,
+				Action:       backendDisableHandler,
+				BashComplete: suggestCloudProvider,
 			},
 		},
 	}
@@ -90,7 +104,7 @@ func removeNodeFromSmap(c *cli.Context) error {
 	if node.IsProxy() {
 		smap, err := getClusterMap(c)
 		if err != nil {
-			return err // cannot happen
+			return err // (unlikely)
 		}
 		if smap.IsPrimary(node) {
 			return fmt.Errorf("%s is primary (cannot remove the primary node)", sname)
@@ -134,7 +148,7 @@ func randMountpath(c *cli.Context) error {
 	if err != nil {
 		return V(err)
 	}
-	cdf := daeStatus.Node.TargetCDF
+	cdf := daeStatus.Node.Tcdf
 	for mpath := range cdf.Mountpaths {
 		fmt.Fprintln(c.App.Writer, mpath)
 		break
@@ -160,5 +174,29 @@ func rotateLogs(c *cli.Context) error {
 		return V(err)
 	}
 	actionDone(c, "cluster: rotated all logs")
+	return nil
+}
+
+func backendEnableHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, c.Command.ArgsUsage)
+	}
+	cloudProvider := c.Args().Get(0)
+	if err := api.EnableBackend(apiBP, cloudProvider); err != nil {
+		return err
+	}
+	actionDone(c, "cluster: enabled "+cloudProvider+" backend")
+	return nil
+}
+
+func backendDisableHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, c.Command.ArgsUsage)
+	}
+	cloudProvider := c.Args().Get(0)
+	if err := api.DisableBackend(apiBP, cloudProvider); err != nil {
+		return err
+	}
+	actionDone(c, "cluster: disabled "+cloudProvider+" backend")
 	return nil
 }

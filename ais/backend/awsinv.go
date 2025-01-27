@@ -119,7 +119,7 @@ func (s3bp *s3bp) initInventory(cloudBck *cmn.Bck, svc *s3.Client, ctx *core.Lso
 	if csv.oname == "" {
 		what := prefix
 		if ctx.ID == "" {
-			what = cos.Either(ctx.Name, aiss3.InvName)
+			what = cos.Left(ctx.Name, aiss3.InvName)
 		}
 		return nil, csv, manifest, http.StatusNotFound, cos.NewErrNotFound(cloudBck, invTag+":"+what)
 	}
@@ -165,27 +165,25 @@ func cleanupOldInventory(cloudBck *cmn.Bck, svc *s3.Client, lsV2resp *s3.ListObj
 }
 
 func checkInvLom(latest time.Time, ctx *core.LsoInvCtx) (time.Time, bool) {
-	finfo, err := os.Stat(ctx.Lom.FQN)
+	size, _, mtime, err := ctx.Lom.Fstat(false /*get-atime*/)
 	if err != nil {
 		debug.Assert(os.IsNotExist(err), err)
 		nlog.Infoln(invTag, "does not exist, getting a new one for the timestamp:", latest)
 		return time.Time{}, false
 	}
+
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infoln(core.T.String(), "checking", ctx.Lom.String(), ctx.Lom.FQN, ctx.Lom.HrwFQN)
 	}
-	mtime := finfo.ModTime()
 	abs := _sinceAbs(mtime, latest)
 	if abs < time.Second {
-		debug.Assert(ctx.Size == 0 || ctx.Size == finfo.Size())
-		ctx.Size = finfo.Size()
+		debug.Assert(ctx.Size == 0 || ctx.Size == size)
+		ctx.Size = size
 
 		// start (or rather, keep) using this one
 		errN := ctx.Lom.Load(true, true)
 		debug.AssertNoErr(errN)
-		debug.Assert(ctx.Lom.SizeBytes() == finfo.Size(), ctx.Lom.SizeBytes(), finfo.Size())
-		// TODO -- FIXME: revisit
-		// debug.Assert(_sinceAbs(mtime, ctx.Lom.Atime()) < time.Second, mtime.String(), ctx.Lom.Atime().String())
+		debug.Assert(ctx.Lom.Lsize() == size, ctx.Lom.Lsize(), size)
 		return time.Time{}, true
 	}
 
@@ -202,7 +200,7 @@ func (s3bp *s3bp) getInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, csv invT)
 	lom.SetSize(csv.size)
 
 	wfqn := fs.CSM.Gen(ctx.Lom, fs.WorkfileType, "")
-	wfh, err := ctx.Lom.CreateFile(wfqn)
+	wfh, err := ctx.Lom.CreateWork(wfqn)
 	if err != nil {
 		return _errInv("create-file", err)
 	}
@@ -248,7 +246,7 @@ func (s3bp *s3bp) getInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, csv invT)
 	// finalize (NOTE a lighter version of FinalizeObj - no redundancy, no locks)
 	if err == nil {
 		lom := ctx.Lom
-		if err = lom.RenameFrom(wfqn); err == nil {
+		if err = lom.RenameFinalize(wfqn); err == nil {
 			if err = os.Chtimes(lom.FQN, csv.mtime, csv.mtime); err == nil {
 				nlog.Infoln("new", invTag+":", lom.Cname(), ctx.Schema)
 
@@ -354,7 +352,7 @@ func (*s3bp) listInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, msg *apc.LsoM
 				}
 			case types.InventoryOptionalFieldETag:
 				if custom != nil {
-					custom[cmn.ETag] = cmn.UnquoteCEV(line[i])
+					custom[cmn.ETag] = line[i]
 				}
 			case types.InventoryOptionalFieldLastModifiedDate:
 				if custom != nil {
@@ -502,7 +500,7 @@ type (
 	}
 	unzipWriter struct {
 		r   *reader
-		wfh *os.File
+		wfh cos.LomWriter
 	}
 )
 

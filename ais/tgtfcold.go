@@ -6,7 +6,6 @@ package ais
 
 import (
 	"io"
-	"os"
 
 	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/cmn"
@@ -19,24 +18,27 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats"
 )
 
 const ftcg = "Warning: failed to cold-GET"
 
 func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 	var (
-		t, lom = goi.t, goi.lom
+		err    error
+		lmfh   cos.LomReader
+		wfh    cos.LomWriter
+		t      = goi.t
+		lom    = goi.lom
 		revert string
 	)
 	if goi.verchanged {
 		revert = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
-		if err := os.Rename(lom.FQN, revert); err != nil {
-			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.FQN, "=>", revert)
+		if errV := lom.RenameMainTo(revert); errV != nil {
+			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.Cname(), "=>", revert)
 			revert = ""
 		}
 	}
-	lmfh, err := lom.CreateFile(lom.FQN)
+	wfh, err = lom.Create()
 	if err != nil {
 		cos.Close(res.R)
 		goi._cleanup(revert, nil, nil, nil, err, "(fcreate)")
@@ -48,28 +50,28 @@ func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 		written   int64
 		buf, slab = t.gmm.AllocSize(min(res.Size, memsys.DefaultBuf2Size))
 		cksumH    = cos.NewCksumHash(lom.CksumConf().Type)
-		mw        = cos.NewWriterMulti(lmfh, cksumH.H)
+		mw        = cos.NewWriterMulti(wfh, cksumH.H)
 	)
 	written, err = cos.CopyBuffer(mw, res.R, buf)
 	cos.Close(res.R)
 
 	if err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(rr/wl)")
+		goi._cleanup(revert, wfh, buf, slab, err, "(rr/wl)")
 		return err
 	}
 	debug.Assertf(written == res.Size, "%s: remote-size %d != %d written", lom.Cname(), res.Size, written)
 
 	if lom.IsFeatureSet(feat.FsyncPUT) {
 		// fsync (flush)
-		if err = lmfh.Sync(); err != nil {
-			goi._cleanup(revert, lmfh, buf, slab, err, "(fsync)")
+		if err = wfh.Sync(); err != nil {
+			goi._cleanup(revert, wfh, buf, slab, err, "(fsync)")
 			return err
 		}
 	}
-	err = lmfh.Close()
-	lmfh = nil
+	err = wfh.Close()
+	wfh = nil
 	if err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(fclose)")
+		goi._cleanup(revert, wfh, buf, slab, err, "(fclose)")
 		return err
 	}
 
@@ -83,24 +85,25 @@ func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 		}
 	}
 	if err = lom.PersistMain(); err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(persist)")
+		goi._cleanup(revert, wfh, buf, slab, err, "(persist)")
 		return err
 	}
 
 	// reopen & transmit ---
-	if lmfh, err = lom.OpenFile(); err != nil {
+	lmfh, err = lom.Open()
+	if err != nil {
 		goi._cleanup(revert, nil, buf, slab, err, "(seek)")
 		return err
 	}
 	var (
 		hrng   *htrange
-		size             = lom.SizeBytes()
+		size             = lom.Lsize()
 		reader io.Reader = lmfh
 		whdr             = goi.w.Header()
 	)
 	if goi.ranges.Range != "" {
 		// (not here if range checksum enabled)
-		rsize := goi.lom.SizeBytes()
+		rsize := goi.lom.Lsize()
 		if goi.ranges.Size > 0 {
 			rsize = goi.ranges.Size
 		}
@@ -116,7 +119,7 @@ func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 	cmn.ToHeader(lom.ObjAttrs(), whdr, size)
 	if goi.dpq.isS3 {
 		// (expecting user to set bucket checksum = md5)
-		s3.SetEtag(whdr, goi.lom)
+		s3.SetS3Headers(whdr, goi.lom)
 	}
 
 	written, err = cos.CopyBuffer(goi.w, reader, buf)
@@ -134,33 +137,28 @@ func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 
 // stats and redundancy (compare w/ goi.txfini)
 func (goi *getOI) _fini(revert string, fullSize, txSize int64) error {
-	// cold get stats
-	goi.t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetColdSize, Value: fullSize},
-		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(goi.ltime)},
-	)
-
+	// latency from cold-get start time.
+	goi.rltime = mono.SinceNano(goi.rstarttime)
 	lom := goi.lom
 	if revert != "" {
 		if err := cos.RemoveFile(revert); err != nil {
-			nlog.InfoDepth(1, ftcg+"(rm-revert)", lom, err)
+			nlog.InfoDepth(1, ftcg, "(rm-revert)", lom, err)
 		}
 	}
 
 	// make copies and slices (async)
 	if err := ec.ECM.EncodeObject(lom, nil); err != nil && err != ec.ErrorECDisabled {
-		nlog.InfoDepth(1, ftcg+"(ec)", lom, err)
+		nlog.InfoDepth(1, ftcg, "(ec)", lom, err)
 	}
 	goi.t.putMirror(lom)
 
 	// load
 	if err := lom.Load(true /*cache it*/, true /*locked*/); err != nil {
 		goi.lom.Unlock(true)
-		nlog.InfoDepth(1, ftcg+"(load)", lom, err) // (unlikely)
+		nlog.InfoDepth(1, ftcg, "(load)", lom, err) // (unlikely)
 		return errSendingResp
 	}
-	debug.Assert(lom.SizeBytes() == fullSize)
+	debug.Assert(lom.Lsize() == fullSize)
 	goi.lom.Unlock(true)
 
 	// regular get stats
@@ -168,28 +166,43 @@ func (goi *getOI) _fini(revert string, fullSize, txSize int64) error {
 	return nil
 }
 
-func (goi *getOI) _cleanup(revert string, lmfh *os.File, buf []byte, slab *memsys.Slab, err error, tag string) {
+func (goi *getOI) _cleanup(revert string, lmfh io.Closer, buf []byte, slab *memsys.Slab, err error, tag string) {
 	if lmfh != nil {
 		lmfh.Close()
 	}
 	if slab != nil {
 		slab.Free(buf)
 	}
-	if err != nil {
-		goi.lom.Remove()
-		if revert != "" {
-			if errV := os.Rename(revert, goi.lom.FQN); errV != nil {
-				nlog.Infoln(ftcg+tag+"(revert)", errV)
-			}
-		}
-		nlog.InfoDepth(1, ftcg+tag, err)
+	if err == nil {
+		goi.lom.Unlock(true)
+		return
 	}
-	goi.lom.Unlock(true)
+
+	lom := goi.lom
+	cname := lom.Cname()
+	if errV := lom.RemoveMain(); errV != nil {
+		nlog.Warningln("failed to remove work-main", cname, errV)
+	}
+	if revert != "" {
+		if errV := lom.RenameToMain(revert); errV != nil {
+			nlog.Warningln("failed to revert", cname, errV)
+		} else {
+			nlog.Infoln("reverted", cname)
+		}
+	}
+	lom.Unlock(true)
+
+	s := err.Error()
+	if cos.IsErrBrokenPipe(err) {
+		s = "[broken pipe]" // EPIPE
+	}
+	nlog.InfoDepth(1, ftcg, tag, cname, "err:", s)
 }
 
 // NOTE:
 // Streaming cold GET feature (`feat.StreamingColdGET`) puts response header on the wire _prior_
 // to finalizing in-cluster object. Use it at your own risk.
+// (under wlock)
 func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 	var (
 		t, lom = goi.t, goi.lom
@@ -197,12 +210,12 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 	)
 	if goi.verchanged {
 		revert = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
-		if err := os.Rename(lom.FQN, revert); err != nil {
+		if err := lom.RenameMainTo(revert); err != nil {
 			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.FQN, "=>", revert)
 			revert = ""
 		}
 	}
-	lmfh, err := lom.CreateFile(lom.FQN)
+	lmfh, err := lom.Create()
 	if err != nil {
 		cos.Close(res.R)
 		goi._cleanup(revert, nil, nil, nil, err, "(fcreate)")
@@ -224,7 +237,7 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 	cmn.ToHeader(lom.ObjAttrs(), whdr, res.Size)
 	if goi.dpq.isS3 {
 		// (expecting user to set bucket checksum = md5)
-		s3.SetEtag(whdr, goi.lom)
+		s3.SetS3Headers(whdr, goi.lom)
 	}
 
 	written, err = cos.CopyBuffer(mw, res.R, buf)

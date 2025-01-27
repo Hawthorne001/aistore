@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 const mock = "mock-backend"
@@ -27,10 +28,10 @@ type mockbp struct {
 // interface guard
 var _ core.Backend = (*mockbp)(nil)
 
-func NewDummyBackend(t core.TargetPut) (core.Backend, error) {
+func NewDummyBackend(t core.TargetPut, _ stats.Tracker) (core.Backend, error) {
 	return &mockbp{
 		t:    t,
-		base: base{mock},
+		base: base{provider: mock},
 	}, nil
 }
 
@@ -57,7 +58,9 @@ func (*mockbp) GetObj(_ context.Context, lom *core.LOM, _ cmn.OWT, _ *http.Reque
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*mockbp) GetObjReader(context.Context, *core.LOM, int64, int64) (res core.GetReaderResult) {
+func (*mockbp) GetObjReader(_ context.Context, lom *core.LOM, _, _ int64) (res core.GetReaderResult) {
+	res.Err = cmn.NewErrRemoteBckOffline(lom.Bucket())
+	res.ErrCode = http.StatusNotFound
 	return
 }
 

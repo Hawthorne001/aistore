@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -46,26 +46,26 @@ type (
 	baseW struct {
 		wmul io.Writer
 		lck  sync.Locker // serialize: (multi-object => single shard)
-		buf  []byte
 		cb   HeaderCallback
 		slab *memsys.Slab
+		buf  []byte
 	}
 	tarWriter struct {
+		tw *tar.Writer
 		baseW
 		format tar.Format
-		tw     *tar.Writer
 	}
 	tgzWriter struct {
-		tw  tarWriter
 		gzw *gzip.Writer
+		tw  tarWriter
 	}
 	zipWriter struct {
-		baseW
 		zw *zip.Writer
+		baseW
 	}
 	lz4Writer struct {
-		tw  tarWriter
 		lzw *lz4.Writer
+		tw  tarWriter
 	}
 )
 
@@ -140,7 +140,7 @@ func (tw *tarWriter) Write(fullname string, oah cos.OAH, reader io.Reader) (err 
 	hdr := tar.Header{
 		Typeflag: tar.TypeReg,
 		Name:     fullname,
-		Size:     oah.SizeBytes(),
+		Size:     oah.Lsize(),
 		ModTime:  time.Unix(0, oah.AtimeUnix()),
 		Mode:     int64(cos.PermRWRR),
 		Format:   tw.format,
@@ -215,7 +215,7 @@ func (zw *zipWriter) Write(fullname string, oah cos.OAH, reader io.Reader) error
 	ziphdr := zip.FileHeader{
 		Name:               fullname,
 		Comment:            fullname,
-		UncompressedSize64: uint64(oah.SizeBytes()),
+		UncompressedSize64: uint64(oah.Lsize()),
 		Modified:           time.Unix(0, oah.AtimeUnix()),
 	}
 	zw.cb(&ziphdr)

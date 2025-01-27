@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -35,7 +35,7 @@ var (
 	cargs = cmn.TransportArgs{
 		UseHTTPProxyEnv: true,
 	}
-	// NOTE: client X509 certificate and other `cmn.TLSArgs` variables can be provided via (os.Getenv) environment.
+	// NOTE: client X.509 certificate and other `cmn.TLSArgs` variables can be provided via (os.Getenv) environment.
 	// See also:
 	// - docs/aisloader.md, section "Environment variables"
 	// - AIS_ENDPOINT and aisEndpoint
@@ -261,7 +261,7 @@ func newTraceCtx(proxyURL string) *traceCtx {
 		err       error
 	)
 	if cos.IsHTTPS(proxyURL) {
-		transport.TLSClientConfig, err = cmn.NewTLS(sargs)
+		transport.TLSClientConfig, err = cmn.NewTLS(sargs, false /*intra-cluster*/)
 		cos.AssertNoErr(err)
 	}
 	tctx.tr = &traceableTransport{
@@ -326,10 +326,10 @@ func s3getDiscard(bck cmn.Bck, objName string) (int64, error) {
 	obj.Body.Close()
 
 	if err != nil {
-		return n, fmt.Errorf("failed to GET %s/%s and discard it (%d, %d): %v", bck, objName, n, size, err)
+		return n, fmt.Errorf("failed to GET %s and discard it (%d, %d): %v", bck.Cname(objName), n, size, err)
 	}
 	if n != size {
-		err = fmt.Errorf("failed to GET %s/%s: wrong size (%d, %d)", bck, objName, n, size)
+		err = fmt.Errorf("failed to GET %s: wrong size (%d, %d)", bck.Cname(objName), n, size)
 	}
 	return size, err
 }
@@ -340,6 +340,7 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int
 	if err != nil {
 		return 0, err
 	}
+	api.SetAuxHeaders(req, &runParams.bp)
 	resp, err := runParams.bp.Client.Do(req)
 	if err != nil {
 		return 0, err
@@ -431,27 +432,35 @@ func listObjCallback(ctx *api.LsoCounter) {
 	if ctx.Count() < 0 {
 		return
 	}
-	fmt.Printf("\rListing %s objects", cos.FormatBigNum(ctx.Count()))
+	fmt.Printf("\rListing %s objects", cos.FormatBigInt(ctx.Count()))
 	if ctx.IsFinished() {
 		fmt.Println()
 	}
 }
 
 // listObjectNames returns a slice of object names of all objects that match the prefix in a bucket.
-func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string, cached bool) ([]string, error) {
-	msg := &apc.LsoMsg{Prefix: prefix}
-	// if bck is remote then check for cached flag
+func listObjectNames(p *params) ([]string, error) {
+	var (
+		bp       = p.bp
+		bck      = p.bck
+		cached   = p.cached
+		listDirs = p.listDirs
+		msg      = &apc.LsoMsg{Prefix: p.subDir}
+	)
 	if cached {
-		msg.Flags |= apc.LsObjCached
+		msg.Flags |= apc.LsObjCached // remote bucket: in-cluster objects only
+	}
+	if !listDirs {
+		msg.Flags |= apc.LsNoDirs // aisloader's default (to override, use --list-dirs)
 	}
 	args := api.ListArgs{Callback: listObjCallback, CallAfter: longListTime}
-	objList, err := api.ListObjects(baseParams, bck, msg, args)
+	lst, err := api.ListObjects(bp, bck, msg, args)
 	if err != nil {
 		return nil, err
 	}
 
-	objs := make([]string, 0, len(objList.Entries))
-	for _, obj := range objList.Entries {
+	objs := make([]string, 0, len(lst.Entries))
+	for _, obj := range lst.Entries {
 		objs = append(objs, obj.Name)
 	}
 	return objs, nil
@@ -460,7 +469,7 @@ func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string, cach
 func initS3Svc() error {
 	// '--s3profile' takes precedence
 	if s3Profile == "" {
-		if profile := os.Getenv(env.AWS.Profile); profile != "" {
+		if profile := os.Getenv(env.AWSProfile); profile != "" {
 			s3Profile = profile
 		}
 	}
@@ -530,7 +539,7 @@ func s3ListObjects() ([]string, error) {
 		}
 		now := mono.NanoTime()
 		if time.Duration(now-prev) >= longListTime {
-			fmt.Printf("\rListing %s objects", cos.FormatBigNum(len(names)))
+			fmt.Printf("\rListing %s objects", cos.FormatBigInt(len(names)))
 			prev = now
 			eol = true
 		}
@@ -549,7 +558,7 @@ func readDiscard(r *http.Response, tag, cksumType string) (int64, string, error)
 		cksumValue string
 	)
 	if r.StatusCode >= http.StatusBadRequest {
-		bytes, err := io.ReadAll(r.Body)
+		bytes, err := cos.ReadAll(r.Body)
 		if err == nil {
 			return 0, "", fmt.Errorf("bad status %d from %s, response: %s", r.StatusCode, tag, string(bytes))
 		}

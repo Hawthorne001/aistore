@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -92,6 +92,10 @@ const SizeofLen = SizeofI32
 // PackedStrLen returns the size occupied by a given string in the output
 func PackedStrLen(s string) int {
 	return SizeofLen + len(s)
+}
+
+func PackedBytesLen(b []byte) int {
+	return SizeofLen + len(b)
 }
 
 func NewUnpacker(buf []byte) *ByteUnpack {
@@ -191,7 +195,7 @@ func (br *ByteUnpack) ReadString() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(bytes), nil
+	return string(bytes), nil // NOTE: dsort (cannot unsafe)
 }
 
 func (br *ByteUnpack) ReadAny(st Unpacker) error {
